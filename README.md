@@ -91,5 +91,5 @@ def my_new_tool(param: str) -> str:
 
 - **LangChain** `0.3.x` - Agent 框架
 - **FastAPI** - 后端 API
-- **OpenAI GPT-4o-mini** - LLM（可替换为其他模型）
+- **OpenAI Claude模型** - LLM（可替换为其他模型）也加入了gpt模型的版本
 - **纯 HTML/CSS/JS** - 前端（零依赖）
