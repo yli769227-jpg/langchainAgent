@@ -1,3 +1,4 @@
+这个项目只是基于国内中转的Claude密钥和对应的URL进行改写的简化平台，打开之后就可以在前端输入对应的密钥和url地址即可，主要麻烦在版本兼容问题。
 # LangChain Agent 🤖
 
 基于 **LangChain + FastAPI + 精美前端** 的全栈智能 Agent 项目。
