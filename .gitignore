@@ -1,0 +1,5 @@
+.langchainVersion/
+__pycache__/
+*.pyc
+.env
+*.key
