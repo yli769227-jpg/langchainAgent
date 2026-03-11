@@ -3,6 +3,7 @@ LangChain Agent Backend - FastAPI
 手动工具调用循环实现，兼容第三方/中转 OpenAI 格式接口
 不依赖 LangGraph，避免 model_dump / tool_calls 格式兼容问题
 """
+# 2024-06-01 by ChatGPT
 import os
 import math
 import datetime
