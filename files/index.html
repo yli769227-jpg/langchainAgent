@@ -1,0 +1,1070 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LangChain Agent · 智能助手</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #111118;
+    --border: #1e1e2e;
+    --border-bright: #2d2d45;
+    --accent: #7c6af7;
+    --accent-dim: #4a3fa0;
+    --accent-glow: rgba(124, 106, 247, 0.15);
+    --green: #00d4aa;
+    --green-dim: rgba(0, 212, 170, 0.1);
+    --amber: #f5a623;
+    --red: #ff5f5f;
+    --text: #e2e2f0;
+    --text-dim: #6b6b8a;
+    --text-muted: #3a3a55;
+    --mono: 'JetBrains Mono', monospace;
+    --sans: 'Syne', sans-serif;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: var(--mono);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* Grid background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(124,106,247,0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(124,106,247,0.04) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Vignette */
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,0.8) 100%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Header */
+  header {
+    position: relative;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(10,10,15,0.9);
+    backdrop-filter: blur(10px);
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .logo-icon {
+    width: 36px;
+    height: 36px;
+    border: 1.5px solid var(--accent);
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .logo-icon::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: var(--accent-glow);
+  }
+
+  .logo-icon svg {
+    width: 18px;
+    height: 18px;
+    stroke: var(--accent);
+    fill: none;
+    stroke-width: 1.5;
+    position: relative;
+    z-index: 1;
+  }
+
+  .logo-text {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .logo-title {
+    font-family: var(--sans);
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: 0.05em;
+  }
+
+  .logo-sub {
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+
+  .status-bar {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+
+  .status-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transition: background 0.3s;
+  }
+
+  .status-dot.active { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; }
+  .status-dot.error { background: var(--red); }
+  .status-dot.pending { background: var(--amber); }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  /* Config panel */
+  .config-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border: 1px solid var(--border-bright);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .config-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-glow);
+  }
+
+  /* Main layout */
+  .app {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+    height: calc(100vh - 65px);
+  }
+
+  /* Sidebar */
+  .sidebar {
+    width: 260px;
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    background: rgba(10,10,15,0.6);
+    flex-shrink: 0;
+  }
+
+  .sidebar-section {
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sidebar-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    color: var(--text-muted);
+    margin-bottom: 12px;
+  }
+
+  /* API Key input */
+  .api-key-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .field-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+
+  .field-input {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  .field-input:focus { border-color: var(--accent); }
+  .field-input::placeholder { color: var(--text-muted); }
+
+  .save-btn {
+    padding: 7px;
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+    text-align: center;
+    transition: all 0.2s;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .save-btn:hover { background: var(--accent); color: #fff; }
+
+  /* Tools list */
+  .tools-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .tool-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    transition: all 0.2s;
+  }
+
+  .tool-item:hover { border-color: var(--border-bright); }
+
+  .tool-item.active-tool {
+    border-color: var(--green);
+    background: var(--green-dim);
+    animation: tool-flash 0.5s ease-out;
+  }
+
+  @keyframes tool-flash {
+    0% { border-color: var(--green); background: rgba(0,212,170,0.3); }
+    100% { border-color: var(--green); background: var(--green-dim); }
+  }
+
+  .tool-icon {
+    font-size: 14px;
+    width: 20px;
+    text-align: center;
+  }
+
+  .tool-name {
+    font-size: 11px;
+    color: var(--text-dim);
+    flex: 1;
+  }
+
+  .tool-badge {
+    font-size: 9px;
+    padding: 2px 5px;
+    background: var(--accent-dim);
+    border-radius: 3px;
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+
+  /* Session info */
+  .session-info {
+    margin-top: auto;
+    padding: 16px;
+    border-top: 1px solid var(--border);
+  }
+
+  .session-id {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+  }
+
+  .clear-btn {
+    width: 100%;
+    padding: 7px;
+    background: transparent;
+    border: 1px solid var(--border-bright);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .clear-btn:hover { border-color: var(--red); color: var(--red); background: rgba(255,95,95,0.05); }
+
+  /* Chat area */
+  .chat-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    scroll-behavior: smooth;
+  }
+
+  .messages::-webkit-scrollbar { width: 4px; }
+  .messages::-webkit-scrollbar-track { background: transparent; }
+  .messages::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 2px; }
+
+  /* Welcome */
+  .welcome {
+    text-align: center;
+    padding: 60px 20px;
+    animation: fadeUp 0.6s ease;
+  }
+
+  .welcome-glyph {
+    font-size: 48px;
+    margin-bottom: 20px;
+    display: block;
+  }
+
+  .welcome-title {
+    font-family: var(--sans);
+    font-size: 28px;
+    font-weight: 800;
+    color: var(--text);
+    margin-bottom: 8px;
+  }
+
+  .welcome-sub {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 32px;
+    letter-spacing: 0.05em;
+  }
+
+  .suggestions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+    max-width: 600px;
+    margin: 0 auto;
+  }
+
+  .suggestion-chip {
+    padding: 8px 14px;
+    border: 1px solid var(--border-bright);
+    border-radius: 20px;
+    font-size: 12px;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all 0.2s;
+    background: var(--surface);
+  }
+
+  .suggestion-chip:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-glow);
+  }
+
+  /* Messages */
+  .message {
+    display: flex;
+    gap: 12px;
+    animation: fadeUp 0.3s ease;
+    max-width: 900px;
+  }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .message.user { flex-direction: row-reverse; margin-left: auto; }
+
+  .avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+  }
+
+  .avatar.user { background: var(--accent-dim); border-color: var(--accent); }
+  .avatar.agent { background: var(--surface); border-color: var(--border-bright); }
+
+  .message-body { flex: 1; }
+  .message.user .message-body { text-align: right; }
+
+  .message-meta {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-bottom: 5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .message-bubble {
+    display: inline-block;
+    max-width: 100%;
+    padding: 12px 16px;
+    border-radius: 10px;
+    font-size: 13px;
+    line-height: 1.6;
+    text-align: left;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .message.user .message-bubble {
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    color: var(--text);
+    border-radius: 10px 2px 10px 10px;
+  }
+
+  .message.agent .message-bubble {
+    background: var(--surface);
+    border: 1px solid var(--border-bright);
+    color: var(--text);
+    border-radius: 2px 10px 10px 10px;
+  }
+
+  /* Tool steps */
+  .tool-steps {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .tool-step {
+    padding: 10px 12px;
+    background: rgba(0,0,0,0.3);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--green);
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .tool-step-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+
+  .tool-step-name {
+    color: var(--green);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .tool-step-input { color: var(--text-muted); font-size: 10px; }
+  .tool-step-output { color: var(--text-dim); margin-top: 4px; }
+
+  /* Thinking indicator */
+  .thinking {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border-bright);
+    border-radius: 2px 10px 10px 10px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .thinking-dots {
+    display: flex;
+    gap: 4px;
+  }
+
+  .thinking-dots span {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: dot-bounce 1.2s infinite;
+  }
+
+  .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+  @keyframes dot-bounce {
+    0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+    40% { transform: translateY(-5px); opacity: 1; }
+  }
+
+  /* Input area */
+  .input-area {
+    padding: 20px 24px;
+    border-top: 1px solid var(--border);
+    background: rgba(10,10,15,0.9);
+    backdrop-filter: blur(10px);
+  }
+
+  .input-wrapper {
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 12px 14px;
+    border: 1px solid var(--border-bright);
+    border-radius: 12px;
+    background: var(--surface);
+    transition: border-color 0.2s;
+  }
+
+  .input-wrapper:focus-within { border-color: var(--accent); }
+
+  #user-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.5;
+    resize: none;
+    min-height: 22px;
+    max-height: 120px;
+    overflow-y: auto;
+  }
+
+  #user-input::placeholder { color: var(--text-muted); }
+
+  #user-input::-webkit-scrollbar { width: 3px; }
+  #user-input::-webkit-scrollbar-thumb { background: var(--border-bright); }
+
+  .send-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    background: var(--accent);
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    flex-shrink: 0;
+  }
+
+  .send-btn:hover { background: #9585ff; transform: scale(1.05); }
+  .send-btn:disabled { background: var(--accent-dim); cursor: not-allowed; transform: none; opacity: 0.5; }
+
+  .send-btn svg {
+    width: 16px;
+    height: 16px;
+    stroke: white;
+    fill: none;
+    stroke-width: 2;
+  }
+
+  .input-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 8px;
+    max-width: 900px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  .input-hint {
+    font-size: 10px;
+    color: var(--text-muted);
+    letter-spacing: 0.05em;
+  }
+
+  /* Error toast */
+  .toast {
+    position: fixed;
+    bottom: 100px;
+    right: 24px;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 1px solid var(--red);
+    border-radius: 8px;
+    font-size: 12px;
+    color: var(--red);
+    z-index: 100;
+    animation: slideIn 0.3s ease;
+    max-width: 320px;
+  }
+
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateX(20px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+
+  /* Server config panel */
+  .server-field-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+  }
+
+  .server-field-row .field-input { flex: 1; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">
+      <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+    </div>
+    <div class="logo-text">
+      <div class="logo-title">LANGCHAIN AGENT</div>
+      <div class="logo-sub">AI · Tools · LLM</div>
+    </div>
+  </div>
+
+  <div class="status-bar">
+    <div class="status-item">
+      <div class="status-dot" id="conn-dot"></div>
+      <span id="conn-label">OFFLINE</span>
+    </div>
+    <div class="status-item">
+      <span id="msg-count">0</span> MSGS
+    </div>
+  </div>
+</header>
+
+<div class="app">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-title">// 配置</div>
+
+      <div class="api-key-group">
+        <div class="field-label">后端地址</div>
+        <div class="server-field-row">
+          <input class="field-input" id="server-url" type="text" value="http://localhost:8000" placeholder="http://localhost:8000">
+        </div>
+
+        <div class="field-label">Anthropic API Key</div>
+        <input class="field-input" id="api-key-input" type="password" placeholder="sk-ant-...">
+
+        <div class="field-label" style="margin-top: 12px;">Anthropic API Base URL (可选)</div>
+        <input class="field-input" id="base-url-input" type="text" placeholder="https://api.anthropic.com (留空使用默认)">
+
+        <button class="save-btn" onclick="saveConfig()">连接 &amp; 测试</button>
+      </div>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-title">// 可用工具</div>
+      <div class="tools-list" id="tools-list">
+        <div class="tool-item">
+          <span class="tool-icon">🧮</span>
+          <span class="tool-name">calculator</span>
+          <span class="tool-badge">math</span>
+        </div>
+        <div class="tool-item">
+          <span class="tool-icon">🕐</span>
+          <span class="tool-name">get_current_time</span>
+          <span class="tool-badge">time</span>
+        </div>
+        <div class="tool-item">
+          <span class="tool-icon">📊</span>
+          <span class="tool-name">text_analyzer</span>
+          <span class="tool-badge">text</span>
+        </div>
+        <div class="tool-item">
+          <span class="tool-icon">🔄</span>
+          <span class="tool-name">unit_converter</span>
+          <span class="tool-badge">conv</span>
+        </div>
+        <div class="tool-item">
+          <span class="tool-icon">🔍</span>
+          <span class="tool-name">word_counter</span>
+          <span class="tool-badge">text</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="session-info">
+      <div class="session-id">SESSION: <span id="session-display"></span></div>
+      <button class="clear-btn" onclick="clearSession()">清除对话历史</button>
+    </div>
+  </div>
+
+  <!-- Chat -->
+  <div class="chat-container">
+    <div class="messages" id="messages">
+      <div class="welcome" id="welcome">
+        <span class="welcome-glyph">⬡</span>
+        <div class="welcome-title">智能 Agent 助手</div>
+        <div class="welcome-sub">基于 LangChain + Claude Sonnet 4 · 多工具自动调用</div>
+        <div class="suggestions">
+          <div class="suggestion-chip" onclick="sendSuggestion(this)">现在几点了？</div>
+          <div class="suggestion-chip" onclick="sendSuggestion(this)">计算 sin(45度) * sqrt(2)</div>
+          <div class="suggestion-chip" onclick="sendSuggestion(this)">100公里等于多少英里？</div>
+          <div class="suggestion-chip" onclick="sendSuggestion(this)">分析这段文字有多少字：人工智能是计算机科学的一个分支</div>
+          <div class="suggestion-chip" onclick="sendSuggestion(this)">98华氏度是多少摄氏度？</div>
+          <div class="suggestion-chip" onclick="sendSuggestion(this)">2的10次方是多少？</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="input-area">
+      <div class="input-wrapper">
+        <textarea id="user-input" rows="1" placeholder="输入问题，Agent 会自动选择合适的工具..."></textarea>
+        <button class="send-btn" id="send-btn" onclick="sendMessage()" disabled>
+          <svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+      <div class="input-footer">
+        <span class="input-hint">Enter 发送 · Shift+Enter 换行</span>
+        <span class="input-hint" id="typing-count">0 字符</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// State
+let apiKey = '';
+let baseUrl = '';
+let serverUrl = 'http://localhost:8000';
+let sessionId = 'session_' + Math.random().toString(36).substr(2, 8);
+let msgCount = 0;
+let isConnected = false;
+let activeTools = new Set();
+
+document.getElementById('session-display').textContent = sessionId.split('_')[1].toUpperCase();
+
+// Auto-resize textarea
+const textarea = document.getElementById('user-input');
+textarea.addEventListener('input', () => {
+  textarea.style.height = 'auto';
+  textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+  document.getElementById('typing-count').textContent = textarea.value.length + ' 字符';
+});
+
+textarea.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    if (!document.getElementById('send-btn').disabled) sendMessage();
+  }
+});
+
+// Config
+async function saveConfig() {
+  serverUrl = document.getElementById('server-url').value.trim() || 'http://localhost:8000';
+  apiKey = document.getElementById('api-key-input').value.trim();
+  baseUrl = document.getElementById('base-url-input').value.trim();
+
+  try {
+    const resp = await fetch(serverUrl + '/health');
+    if (resp.ok) {
+      setStatus('active');
+      document.getElementById('send-btn').disabled = false;
+      showToast('✓ 连接成功！', 'green');
+
+      // Load tools
+      const toolsResp = await fetch(serverUrl + '/tools');
+      const toolsData = await toolsResp.json();
+      renderToolsList(toolsData.tools);
+      isConnected = true;
+    }
+  } catch (e) {
+    setStatus('error');
+    showToast('✗ 无法连接到后端，请检查服务是否启动', 'red');
+  }
+}
+
+function renderToolsList(tools) {
+  const icons = { calculator: '🧮', get_current_time: '🕐', text_analyzer: '📊', unit_converter: '🔄', word_counter: '🔍' };
+  const badges = { calculator: 'math', get_current_time: 'time', text_analyzer: 'text', unit_converter: 'conv', word_counter: 'text' };
+  const container = document.getElementById('tools-list');
+  container.innerHTML = tools.map(t => `
+    <div class="tool-item" id="tool-${t.name}" title="${t.description}">
+      <span class="tool-icon">${icons[t.name] || '🔧'}</span>
+      <span class="tool-name">${t.name}</span>
+      <span class="tool-badge">${badges[t.name] || 'fn'}</span>
+    </div>
+  `).join('');
+}
+
+function setStatus(state) {
+  const dot = document.getElementById('conn-dot');
+  const label = document.getElementById('conn-label');
+  dot.className = 'status-dot ' + state;
+  if (state === 'active') label.textContent = 'ONLINE';
+  else if (state === 'error') label.textContent = 'ERROR';
+  else if (state === 'pending') label.textContent = 'LOADING';
+  else label.textContent = 'OFFLINE';
+}
+
+// Send
+async function sendMessage() {
+  const input = textarea.value.trim();
+  if (!input) return;
+
+  // Check API key
+  if (!apiKey) {
+    showToast('请先输入 Anthropic API Key', 'amber');
+    return;
+  }
+
+  if (!isConnected) {
+    showToast('请先配置并连接后端服务', 'amber');
+    return;
+  }
+
+  // Hide welcome
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  // Add user message
+  appendMessage('user', input);
+  textarea.value = '';
+  textarea.style.height = 'auto';
+  document.getElementById('typing-count').textContent = '0 字符';
+  document.getElementById('send-btn').disabled = true;
+
+  // Thinking indicator
+  const thinkingId = appendThinking();
+  setStatus('pending');
+
+  try {
+    const resp = await fetch(serverUrl + '/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: input,
+        session_id: sessionId,
+        api_key: apiKey,
+        base_url: baseUrl || null
+      })
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.detail || '请求失败');
+    }
+
+    const data = await resp.json();
+    removeThinking(thinkingId);
+
+    // Flash used tools
+    if (data.steps && data.steps.length > 0) {
+      data.steps.forEach(step => {
+        const el = document.getElementById('tool-' + step.tool);
+        if (el) {
+          el.classList.add('active-tool');
+          setTimeout(() => el.classList.remove('active-tool'), 2000);
+        }
+      });
+    }
+
+    appendMessage('agent', data.response, data.steps);
+    setStatus('active');
+    msgCount++;
+    document.getElementById('msg-count').textContent = msgCount;
+
+  } catch (e) {
+    removeThinking(thinkingId);
+    appendMessage('agent', '⚠️ 错误: ' + e.message);
+    setStatus('error');
+  }
+
+  document.getElementById('send-btn').disabled = false;
+  scrollToBottom();
+}
+
+function sendSuggestion(el) {
+  textarea.value = el.textContent;
+  sendMessage();
+}
+
+// Message rendering
+function appendMessage(role, text, steps) {
+  const container = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'message ' + role;
+
+  const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const avatar = role === 'user' ? '👤' : '⬡';
+  const label = role === 'user' ? 'YOU' : 'AGENT';
+
+  let stepsHTML = '';
+  if (steps && steps.length > 0) {
+    stepsHTML = `<div class="tool-steps">` + steps.map(s => `
+      <div class="tool-step">
+        <div class="tool-step-header">
+          <span>⚙</span>
+          <span class="tool-step-name">${s.tool}</span>
+          <span class="tool-step-input">← ${JSON.stringify(s.input)}</span>
+        </div>
+        <div class="tool-step-output">${s.output}</div>
+      </div>
+    `).join('') + `</div>`;
+  }
+
+  div.innerHTML = `
+    <div class="avatar ${role}">${avatar}</div>
+    <div class="message-body">
+      <div class="message-meta">${label} · ${time}</div>
+      <div class="message-bubble">${escapeHtml(text)}</div>
+      ${stepsHTML}
+    </div>
+  `;
+
+  container.appendChild(div);
+  scrollToBottom();
+}
+
+function appendThinking() {
+  const id = 'thinking-' + Date.now();
+  const container = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.id = id;
+  div.className = 'message agent';
+  div.innerHTML = `
+    <div class="avatar agent">⬡</div>
+    <div class="message-body">
+      <div class="message-meta">AGENT · 思考中</div>
+      <div class="thinking">
+        <span>Agent 正在处理</span>
+        <div class="thinking-dots"><span></span><span></span><span></span></div>
+      </div>
+    </div>
+  `;
+  container.appendChild(div);
+  scrollToBottom();
+  return id;
+}
+
+function removeThinking(id) {
+  const el = document.getElementById(id);
+  if (el) el.remove();
+}
+
+function scrollToBottom() {
+  const container = document.getElementById('messages');
+  container.scrollTop = container.scrollHeight;
+}
+
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Toast
+function showToast(msg, color = 'red') {
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+
+  const toast = document.createElement('div');
+  toast.className = 'toast';
+  toast.style.borderColor = color === 'green' ? 'var(--green)' : color === 'amber' ? 'var(--amber)' : 'var(--red)';
+  toast.style.color = color === 'green' ? 'var(--green)' : color === 'amber' ? 'var(--amber)' : 'var(--red)';
+  toast.textContent = msg;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3500);
+}
+
+// Clear session
+async function clearSession() {
+  try {
+    if (isConnected) {
+      await fetch(serverUrl + '/chat/' + sessionId, { method: 'DELETE' });
+    }
+  } catch (e) {}
+
+  // Reset
+  sessionId = 'session_' + Math.random().toString(36).substr(2, 8);
+  document.getElementById('session-display').textContent = sessionId.split('_')[1].toUpperCase();
+  msgCount = 0;
+  document.getElementById('msg-count').textContent = 0;
+
+  const container = document.getElementById('messages');
+  container.innerHTML = `
+    <div class="welcome" id="welcome">
+      <span class="welcome-glyph">⬡</span>
+      <div class="welcome-title">对话已清除</div>
+      <div class="welcome-sub">开始新的对话</div>
+      <div class="suggestions">
+        <div class="suggestion-chip" onclick="sendSuggestion(this)">现在几点了？</div>
+        <div class="suggestion-chip" onclick="sendSuggestion(this)">计算 sin(45度) * sqrt(2)</div>
+        <div class="suggestion-chip" onclick="sendSuggestion(this)">100公里等于多少英里？</div>
+        <div class="suggestion-chip" onclick="sendSuggestion(this)">分析这段文字有多少字：人工智能是计算机科学的一个分支</div>
+      </div>
+    </div>
+  `;
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+.DS_Store
+.langchainVersion/
+__pycache__/
+*.pyc
+*.pyo
+.env
