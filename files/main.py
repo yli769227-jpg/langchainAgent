@@ -8,6 +8,8 @@ import os
 import math
 import datetime
 import json
+import logging
+import re
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,16 +20,38 @@ import urllib.request
 import urllib.parse
 import ssl
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+)
+logger = logging.getLogger("agent")
+
+
+def mask_key(k: str) -> str:
+    """掩码 API Key，只保留前 6 后 4 便于排查又不泄漏。"""
+    if not k:
+        return "<empty>"
+    if len(k) <= 10:
+        return "***"
+    return f"{k[:6]}...{k[-4:]}"
+
+
+# 第三方中转服务可能用自签证书，默认仍校验；如需关闭由环境变量开启
 _ssl_ctx = ssl.create_default_context()
-_ssl_ctx.check_hostname = False
-_ssl_ctx.verify_mode = ssl.CERT_NONE
+if os.getenv("AGENT_INSECURE_SSL") == "1":
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode = ssl.CERT_NONE
+    logger.warning("SSL 证书验证已关闭 (AGENT_INSECURE_SSL=1)")
+
 from openai import OpenAI
 
 app = FastAPI(title="LangChain Agent API", version="1.0.0")
 
+# CORS 白名单：允许本地开发 + file:// 打开前端
+_allowed_origin_re = re.compile(r"^(https?://localhost(:\d+)?|https?://127\.0\.0\.1(:\d+)?|null)$")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=_allowed_origin_re.pattern,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -445,12 +469,13 @@ def run_agent(api_key: str, base_url: str, model_name: str, messages: list) -> t
 
 # ==================== API Models ====================
 
-# 硬编码配置，不在前端暴露
-API_KEY = "REDACTED_API_KEY"
-BASE_URL = "https://api.penguinsaichat.dpdns.org/v1"
+# 凭证一律从前端请求传入，服务器不保存
+class _WithCreds(BaseModel):
+    api_key: str
+    base_url: str
 
 
-class ChatRequest(BaseModel):
+class ChatRequest(_WithCreds):
     message: str
     session_id: str = "default"
     model_name: str = "claude-sonnet-4-6"
@@ -479,6 +504,10 @@ async def get_tools():
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    logger.info("POST /chat session=%s model=%s key=%s base=%s msg_len=%d",
+                req.session_id, req.model_name, mask_key(req.api_key), req.base_url, len(req.message))
+    if not req.api_key or not req.base_url:
+        raise HTTPException(status_code=400, detail="缺少 api_key 或 base_url（请在前端设置中填写）")
     try:
         history = session_histories.get(req.session_id, [])
 
@@ -495,7 +524,7 @@ async def chat(req: ChatRequest):
         )
 
         response_text, steps = await asyncio.to_thread(
-            run_agent, API_KEY, BASE_URL, req.model_name, messages
+            run_agent, req.api_key, req.base_url, req.model_name, messages
         )
 
         # 更新历史，保留最近 20 条
@@ -510,11 +539,16 @@ async def chat(req: ChatRequest):
         }
 
     except Exception as e:
+        logger.exception("/chat 处理异常 session=%s", req.session_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
+    logger.info("POST /chat/stream session=%s model=%s key=%s base=%s msg_len=%d",
+                req.session_id, req.model_name, mask_key(req.api_key), req.base_url, len(req.message))
+    if not req.api_key or not req.base_url:
+        raise HTTPException(status_code=400, detail="缺少 api_key 或 base_url（请在前端设置中填写）")
     history = session_histories.get(req.session_id, [])
     system = SYSTEM_PROMPT
     if req.kb_id and req.kb_id in knowledge_bases:
@@ -528,7 +562,7 @@ async def chat_stream(req: ChatRequest):
     )
 
     async def generate():
-        client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        client = OpenAI(api_key=req.api_key, base_url=req.base_url)
         steps = []
         for _ in range(10):
             stream = client.chat.completions.create(
@@ -686,7 +720,7 @@ class WorkflowData(BaseModel):
     nodes: list[WorkflowNode] = []
     edges: list[WorkflowEdge] = []
 
-class WorkflowRunRequest(BaseModel):
+class WorkflowRunRequest(_WithCreds):
     workflow_id: str
     input: str
     variables: dict = {}
@@ -796,7 +830,7 @@ async def run_workflow(req: WorkflowRunRequest):
             msgs = ([{"role": "system", "content": (prompt_prefix + "\n" + system).strip()}]
                     + history
                     + [{"role": "user", "content": current_input}])
-            resp_text, steps = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, cfg.get("model", "claude-sonnet-4-6"), msgs)
+            resp_text, steps = await asyncio.to_thread(run_agent, req.api_key, req.base_url, cfg.get("model", "claude-sonnet-4-6"), msgs)
             current_input = resp_text
             final_response = resp_text
             execution_log.append({"node": node["label"], "type": "llm", "output": resp_text, "steps": steps})
@@ -880,7 +914,7 @@ class AgentData(BaseModel):
     available_tools: list[str] = []
     max_steps: int = 10
 
-class AgentChatRequest(BaseModel):
+class AgentChatRequest(_WithCreds):
     message: str
     session_id: str = "default"
 
@@ -951,15 +985,15 @@ async def delete_agent(agent_id: str):
 
 # ── 多智能体协同执行引擎 ──
 
-def _call_sub_agent(sub_ag: dict, user_input: str, session_id: str) -> tuple[str, list]:
+def _call_sub_agent(sub_ag: dict, user_input: str, session_id: str, api_key: str, base_url: str) -> tuple[str, list]:
     """调用单个子 agent，返回 (回复文本, 工具步骤)"""
     system = sub_ag.get("system_prompt") or SYSTEM_PROMPT
     history = session_histories.get(session_id, [])
     messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_input}]
-    return run_agent(API_KEY, BASE_URL, sub_ag.get("model_name", "claude-sonnet-4-6"), messages)
+    return run_agent(api_key, base_url, sub_ag.get("model_name", "claude-sonnet-4-6"), messages)
 
 
-async def run_multi_agent_chat(ag: dict, user_input: str, session_id: str) -> dict:
+async def run_multi_agent_chat(ag: dict, user_input: str, session_id: str, api_key: str, base_url: str) -> dict:
     sub_ids = ag.get("sub_agents", [])
     mode = ag.get("collaboration_mode", "sequential")
     valid_subs = [agents[sid] for sid in sub_ids if sid in agents]
@@ -969,7 +1003,7 @@ async def run_multi_agent_chat(ag: dict, user_input: str, session_id: str) -> di
         history = session_histories.get(session_id, [])
         system = ag.get("system_prompt") or SYSTEM_PROMPT
         messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_input}]
-        response_text, steps = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag.get("model_name", "claude-sonnet-4-6"), messages)
+        response_text, steps = await asyncio.to_thread(run_agent, api_key, base_url, ag.get("model_name", "claude-sonnet-4-6"), messages)
         history.append({"role": "user", "content": user_input})
         history.append({"role": "assistant", "content": response_text})
         session_histories[session_id] = history[-20:]
@@ -980,7 +1014,7 @@ async def run_multi_agent_chat(ag: dict, user_input: str, session_id: str) -> di
     if mode == "sequential":
         current_input = user_input
         for sub in valid_subs:
-            text, steps = await asyncio.to_thread(_call_sub_agent, sub, current_input, session_id)
+            text, steps = await asyncio.to_thread(_call_sub_agent, sub, current_input, session_id, api_key, base_url)
             log.append({"agent_name": sub["name"], "agent_id": sub["id"], "input": current_input, "output": text, "steps": steps})
             current_input = text
         final = current_input
@@ -988,7 +1022,7 @@ async def run_multi_agent_chat(ag: dict, user_input: str, session_id: str) -> di
     elif mode == "parallel":
         import concurrent.futures
         loop = asyncio.get_event_loop()
-        tasks = [loop.run_in_executor(None, _call_sub_agent, sub, user_input, session_id) for sub in valid_subs]
+        tasks = [loop.run_in_executor(None, _call_sub_agent, sub, user_input, session_id, api_key, base_url) for sub in valid_subs]
         results = await asyncio.gather(*tasks)
         for sub, (text, steps) in zip(valid_subs, results):
             log.append({"agent_name": sub["name"], "agent_id": sub["id"], "input": user_input, "output": text, "steps": steps})
@@ -998,27 +1032,27 @@ async def run_multi_agent_chat(ag: dict, user_input: str, session_id: str) -> di
             summary_prompt += f"【{entry['agent_name']}】的回答:\n{entry['output']}\n\n"
         system = ag.get("system_prompt") or "你是一个汇总助手，请综合多个助手的回答给出最终答案。"
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": summary_prompt}]
-        final, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], msgs)
+        final, _ = await asyncio.to_thread(run_agent, api_key, base_url, ag["model_name"], msgs)
 
     elif mode == "debate":
         # 第一轮：各自回答
         round1 = {}
         for sub in valid_subs:
-            text, steps = await asyncio.to_thread(_call_sub_agent, sub, user_input, session_id)
+            text, steps = await asyncio.to_thread(_call_sub_agent, sub, user_input, session_id, api_key, base_url)
             round1[sub["id"]] = text
             log.append({"agent_name": sub["name"], "agent_id": sub["id"], "round": 1, "output": text, "steps": steps})
         # 第二轮：看到其他人的观点后再回答
         for sub in valid_subs:
             others = "\n\n".join(f"【{agents[sid]['name']}】的观点: {round1[sid]}" for sid in round1 if sid != sub["id"])
             debate_input = f"用户问题: {user_input}\n\n其他助手的观点:\n{others}\n\n请在看到其他观点后，给出你的最终回答。你可以坚持自己的观点，也可以修正。"
-            text, steps = await asyncio.to_thread(_call_sub_agent, sub, debate_input, session_id)
+            text, steps = await asyncio.to_thread(_call_sub_agent, sub, debate_input, session_id, api_key, base_url)
             log.append({"agent_name": sub["name"], "agent_id": sub["id"], "round": 2, "output": text, "steps": steps})
         # 主 agent 裁决
         all_views = "\n\n".join(f"【{e['agent_name']}】(第{e['round']}轮): {e['output']}" for e in log)
         judge_prompt = f"以下是多个助手经过两轮辩论后的观点。请作为裁判，综合所有观点给出最终结论。\n\n用户问题: {user_input}\n\n{all_views}"
         system = ag.get("system_prompt") or "你是辩论裁判，请综合各方观点给出公正的最终结论。"
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": judge_prompt}]
-        final, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], msgs)
+        final, _ = await asyncio.to_thread(run_agent, api_key, base_url, ag["model_name"], msgs)
     else:
         final = "不支持的协作模式"
 
@@ -1056,7 +1090,7 @@ REFLECT_PROMPT = """你是一个任务执行评估专家。请评估当前步骤
 只输出 JSON。"""
 
 
-async def run_autonomous_chat(ag: dict, user_input: str, session_id: str) -> dict:
+async def run_autonomous_chat(ag: dict, user_input: str, session_id: str, api_key: str, base_url: str) -> dict:
     available = ag.get("available_tools", [])
     max_steps = ag.get("max_steps", 10)
     tool_names = ", ".join(available) if available else "无"
@@ -1065,7 +1099,7 @@ async def run_autonomous_chat(ag: dict, user_input: str, session_id: str) -> dic
     # 1. 规划阶段
     plan_system = PLAN_PROMPT.format(tools=tool_names, max_steps=max_steps)
     plan_msgs = [{"role": "system", "content": plan_system}, {"role": "user", "content": user_input}]
-    plan_text, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], plan_msgs)
+    plan_text, _ = await asyncio.to_thread(run_agent, api_key, base_url, ag["model_name"], plan_msgs)
 
     try:
         # 提取 JSON（兼容 markdown code block）
@@ -1103,7 +1137,7 @@ async def run_autonomous_chat(ag: dict, user_input: str, session_id: str) -> dic
         exec_msgs = [{"role": "system", "content": system}, {"role": "user", "content": exec_prompt}]
 
         # 执行（带工具调用）
-        client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        client = OpenAI(api_key=api_key, base_url=base_url)
         exec_steps = []
         for _ in range(5):
             response = await asyncio.to_thread(
@@ -1145,7 +1179,7 @@ async def run_autonomous_chat(ag: dict, user_input: str, session_id: str) -> dic
             completed=json.dumps(completed_results, ensure_ascii=False), current_result=step_result
         )
         reflect_msgs = [{"role": "system", "content": reflect_system}, {"role": "user", "content": "请评估"}]
-        reflect_text, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], reflect_msgs)
+        reflect_text, _ = await asyncio.to_thread(run_agent, api_key, base_url, ag["model_name"], reflect_msgs)
 
         try:
             rclean = reflect_text.strip()
@@ -1164,7 +1198,7 @@ async def run_autonomous_chat(ag: dict, user_input: str, session_id: str) -> dic
         if reflection.get("need_replan"):
             replan_prompt = f"原始任务: {user_input}\n已完成步骤结果: {json.dumps(completed_results, ensure_ascii=False)}\n反思: {reflection.get('reason', '')}\n\n请重新规划剩余步骤。"
             replan_msgs = [{"role": "system", "content": plan_system}, {"role": "user", "content": replan_prompt}]
-            replan_text, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], replan_msgs)
+            replan_text, _ = await asyncio.to_thread(run_agent, api_key, base_url, ag["model_name"], replan_msgs)
             try:
                 rp_clean = replan_text.strip()
                 if "```" in rp_clean:
@@ -1186,7 +1220,7 @@ async def run_autonomous_chat(ag: dict, user_input: str, session_id: str) -> dic
     summary_prompt = f"原始任务: {user_input}\n\n执行结果:\n" + "\n".join(f"步骤{j+1}: {r}" for j, r in enumerate(completed_results)) + "\n\n请给出最终的综合回答。"
     system = ag.get("system_prompt") or SYSTEM_PROMPT
     summary_msgs = [{"role": "system", "content": system}, {"role": "user", "content": summary_prompt}]
-    final, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], summary_msgs)
+    final, _ = await asyncio.to_thread(run_agent, api_key, base_url, ag["model_name"], summary_msgs)
 
     history = session_histories.get(session_id, [])
     history.append({"role": "user", "content": user_input})
@@ -1203,9 +1237,9 @@ async def agent_chat(agent_id: str, req: AgentChatRequest):
     atype = ag.get("agent_type", "multi_agent")
 
     if atype == "multi_agent":
-        return await run_multi_agent_chat(ag, req.message, req.session_id)
+        return await run_multi_agent_chat(ag, req.message, req.session_id, req.api_key, req.base_url)
     elif atype == "autonomous":
-        return await run_autonomous_chat(ag, req.message, req.session_id)
+        return await run_autonomous_chat(ag, req.message, req.session_id, req.api_key, req.base_url)
     else:
         raise HTTPException(status_code=400, detail=f"不支持的 Agent 类型: {atype}")
 

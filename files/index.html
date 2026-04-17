@@ -1197,6 +1197,27 @@ body::before {
   </div>
 </div>
 
+<!-- ── 设置 Modal（API Key / Base URL） ── -->
+<div id="settings-modal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.45);align-items:center;justify-content:center;">
+  <div style="background:#fff;border-radius:12px;padding:28px 32px;width:460px;max-width:90vw;box-shadow:0 20px 50px rgba(0,0,0,0.25);">
+    <div style="font-size:18px;font-weight:600;margin-bottom:6px;">模型连接设置</div>
+    <div style="font-size:13px;color:#888;margin-bottom:20px;">Key 仅保存在你本机浏览器，每次请求直接传给后端，服务器不落盘。</div>
+    <div style="margin-bottom:14px;">
+      <label style="display:block;font-size:13px;color:#333;margin-bottom:6px;font-weight:500;">API Key</label>
+      <input id="settings-api-key" type="password" placeholder="sk-..." style="width:100%;padding:9px 12px;border:1px solid #ddd;border-radius:6px;font-size:13px;box-sizing:border-box;" />
+    </div>
+    <div style="margin-bottom:14px;">
+      <label style="display:block;font-size:13px;color:#333;margin-bottom:6px;font-weight:500;">Base URL</label>
+      <input id="settings-base-url" type="text" placeholder="https://api.openai.com/v1" style="width:100%;padding:9px 12px;border:1px solid #ddd;border-radius:6px;font-size:13px;box-sizing:border-box;" />
+    </div>
+    <div id="settings-error" style="color:#c33;font-size:12px;margin-bottom:12px;display:none;"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;">
+      <button onclick="closeSettings()" style="padding:8px 18px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:13px;">取消</button>
+      <button onclick="saveSettings()" style="padding:8px 18px;border:none;background:#1f6feb;color:#fff;border-radius:6px;cursor:pointer;font-size:13px;">保存</button>
+    </div>
+  </div>
+</div>
+
 
 <style>
 /* ══════════════════════════════════════
@@ -1713,6 +1734,10 @@ body::before {
   <div class="nav-item" onclick="showPage('tools',this)">
     <svg class="nav-item-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
     工具列表
+  </div>
+  <div class="nav-item" onclick="openSettings()">
+    <svg class="nav-item-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    设置
   </div>
 
   <div class="nav-bottom">
@@ -2295,6 +2320,50 @@ body::before {
 const API = 'http://localhost:8000';
 
 // ══════════════════════════════════════
+// SETTINGS: API Key + Base URL
+// 仅存在浏览器 localStorage，不落盘后端
+// ══════════════════════════════════════
+let apiKey = localStorage.getItem('af_api_key') || '';
+let baseUrl = localStorage.getItem('af_base_url') || '';
+
+function getCreds() {
+  return { api_key: apiKey, base_url: baseUrl };
+}
+
+function ensureCreds() {
+  if (!apiKey || !baseUrl) {
+    if (typeof toast === 'function') toast('请先在「设置」里填写 API Key 和 Base URL', 'error');
+    openSettings();
+    return false;
+  }
+  return true;
+}
+
+function openSettings() {
+  document.getElementById('settings-api-key').value = apiKey;
+  document.getElementById('settings-base-url').value = baseUrl || 'https://api.openai.com/v1';
+  document.getElementById('settings-error').style.display = 'none';
+  document.getElementById('settings-modal').style.display = 'flex';
+}
+
+function closeSettings() {
+  document.getElementById('settings-modal').style.display = 'none';
+}
+
+function saveSettings() {
+  const k = document.getElementById('settings-api-key').value.trim();
+  const u = document.getElementById('settings-base-url').value.trim();
+  const err = document.getElementById('settings-error');
+  if (!k) { err.textContent = '请填写 API Key'; err.style.display = 'block'; return; }
+  if (!u || !/^https?:\/\//.test(u)) { err.textContent = 'Base URL 必须以 http(s):// 开头'; err.style.display = 'block'; return; }
+  apiKey = k; baseUrl = u;
+  localStorage.setItem('af_api_key', k);
+  localStorage.setItem('af_base_url', u);
+  closeSettings();
+  if (typeof toast === 'function') toast('已保存', 'success');
+}
+
+// ══════════════════════════════════════
 // NAVIGATION
 // ══════════════════════════════════════
 function showPage(id, el) {
@@ -2726,7 +2795,7 @@ async function sendAgentPreview() {
   try {
     const res = await fetch(API + '/agent/' + activeAgentId + '/chat', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ message: msg, session_id: 'preview-' + activeAgentId })
+      body: JSON.stringify({ message: msg, session_id: 'preview-' + activeAgentId, ...getCreds() })
     });
     const data = await res.json();
     const loading = document.getElementById('acfg-preview-loading');
@@ -4264,7 +4333,7 @@ async function runWorkflow() {
     const r = await fetch(API + '/workflow/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ workflow_id: currentWfId, input, variables, session_id: 'wf_' + currentWfId })
+      body: JSON.stringify({ workflow_id: currentWfId, input, variables, session_id: 'wf_' + currentWfId, ...getCreds() })
     });
     const d = await r.json();
     const typeColors = { start:'var(--green)', end:'var(--red)', llm:'var(--accent)', tool:'var(--orange)', knowledge:'var(--blue)', condition:'#fbbf24' };
@@ -4303,6 +4372,7 @@ chatInput.addEventListener('keydown', e => {
 async function sendChatMessage() {
   const input = chatInput.value.trim();
   if (!input) return;
+  if (!ensureCreds()) return;
   const welcome = document.getElementById('chat-welcome');
   if (welcome) welcome.remove();
   appendMsg('user', input);
@@ -4338,7 +4408,7 @@ async function sendChatMessage() {
       const resp = await fetch(API + '/agent/' + agentId + '/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: input, session_id: chatSessionId })
+        body: JSON.stringify({ message: input, session_id: chatSessionId, ...getCreds() })
       });
       const data = await resp.json();
       fullText = data.response || '处理完成';
@@ -4408,7 +4478,7 @@ async function sendChatMessage() {
       const resp = await fetch(API + '/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: input, session_id: chatSessionId, kb_id: kbId || null })
+      body: JSON.stringify({ message: input, session_id: chatSessionId, kb_id: kbId || null, ...getCreds() })
     });
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -4588,6 +4658,7 @@ function doLogin() {
     document.getElementById('login-page').style.display = 'none';
     errEl.textContent = '';
     input.classList.remove('error');
+    if (!apiKey || !baseUrl) openSettings();
   } else {
     errEl.textContent = '密码错误，请重试';
     input.classList.add('error');
