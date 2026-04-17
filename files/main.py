@@ -3,7 +3,7 @@ LangChain Agent Backend - FastAPI
 手动工具调用循环实现，兼容第三方/中转 OpenAI 格式接口
 不依赖 LangGraph，避免 model_dump / tool_calls 格式兼容问题
 """
-# 2024-06-01 by ChatGPT
+
 import os
 import math
 import datetime
@@ -11,6 +11,7 @@ import json
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import asyncio
 import urllib.request
@@ -363,18 +364,9 @@ TOOLS_SCHEMA = [
     }
 ]
 
-SYSTEM_PROMPT = """你是一个智能助手，具备多种实用工具能力。你可以帮助用户进行：
-- 数学计算（使用 calculator 工具）
-- 查询当前时间（使用 get_current_time 工具）
-- 文本分析（使用 text_analyzer 工具）
-- 单位换算（使用 unit_converter 工具）
-- 词语统计（使用 word_counter 工具）
-- 查询实时天气（使用 get_weather 工具）
-- 搜索知识库（使用 search_knowledge_base 工具，需提供 kb_id）
-
-请根据用户的问题，灵活使用工具，给出准确、有用的回答。
+SYSTEM_PROMPT = """你是一个智能助手。请根据用户的问题给出准确、有用的回答。
 回答时请用中文，并保持友好、专业的语气。
-如果不需要工具，直接回答即可。"""
+如果需要使用工具来回答问题，请直接使用，不要向用户列举你的工具能力。"""
 
 # 全局会话历史
 session_histories: dict[str, list] = {}
@@ -521,7 +513,92 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/chat/{session_id}")
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    history = session_histories.get(req.session_id, [])
+    system = SYSTEM_PROMPT
+    if req.kb_id and req.kb_id in knowledge_bases:
+        kb = knowledge_bases[req.kb_id]
+        system += f"\n\n当前对话已关联知识库「{kb['name']}」(ID: {req.kb_id})。当用户提问与该知识库相关时，请使用 search_knowledge_base 工具（kb_id=\"{req.kb_id}\"）检索后再回答。"
+
+    messages = (
+        [{"role": "system", "content": system}]
+        + history
+        + [{"role": "user", "content": req.message}]
+    )
+
+    async def generate():
+        client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        steps = []
+        for _ in range(10):
+            stream = client.chat.completions.create(
+                model=req.model_name,
+                messages=messages,
+                tools=TOOLS_SCHEMA,
+                tool_choice="auto",
+                stream=True,
+            )
+            content_parts = []
+            tool_calls_map = {}
+            for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if not delta:
+                    continue
+                if delta.content:
+                    content_parts.append(delta.content)
+                    yield f"data: {json.dumps({'type':'token','content':delta.content}, ensure_ascii=False)}\n\n"
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls_map:
+                            tool_calls_map[idx] = {"id": tc.id or "", "name": "", "arguments": ""}
+                        if tc.id:
+                            tool_calls_map[idx]["id"] = tc.id
+                        if tc.function:
+                            if tc.function.name:
+                                tool_calls_map[idx]["name"] = tc.function.name
+                            if tc.function.arguments:
+                                tool_calls_map[idx]["arguments"] += tc.function.arguments
+
+            full_content = "".join(content_parts)
+
+            if not tool_calls_map:
+                # No tool calls, done
+                history.append({"role": "user", "content": req.message})
+                history.append({"role": "assistant", "content": full_content})
+                session_histories[req.session_id] = history[-20:]
+                yield f"data: {json.dumps({'type':'done','steps':steps}, ensure_ascii=False)}\n\n"
+                return
+
+            # Process tool calls
+            assistant_msg = {
+                "role": "assistant",
+                "content": full_content or "",
+                "tool_calls": [
+                    {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                    for tc in tool_calls_map.values()
+                ]
+            }
+            messages.append(assistant_msg)
+
+            for tc in tool_calls_map.values():
+                func_name = tc["name"]
+                try:
+                    func_args = json.loads(tc["arguments"])
+                except Exception:
+                    func_args = {}
+                if func_name in TOOL_FUNCTIONS:
+                    tool_result = TOOL_FUNCTIONS[func_name](**func_args)
+                else:
+                    tool_result = f"未知工具: {func_name}"
+                step = {"tool": func_name, "input": func_args, "output": tool_result}
+                steps.append(step)
+                yield f"data: {json.dumps({'type':'tool','step':step}, ensure_ascii=False)}\n\n"
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": tool_result})
+
+        yield f"data: {json.dumps({'type':'done','steps':steps}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 async def clear_history(session_id: str):
     if session_id in session_histories:
         del session_histories[session_id]
@@ -585,6 +662,552 @@ async def delete_kb(kb_id: str):
         raise HTTPException(status_code=404, detail="知识库不存在")
     del knowledge_bases[kb_id]
     return {"message": f"知识库 {kb_id} 已删除"}
+
+
+# ==================== 工作流 API ====================
+
+class WorkflowNode(BaseModel):
+    id: str
+    type: str  # "start" | "llm" | "tool" | "condition" | "end" | "knowledge"
+    label: str
+    x: float
+    y: float
+    config: dict = {}
+
+class WorkflowEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+    label: str = ""
+
+class WorkflowData(BaseModel):
+    name: str
+    description: str = ""
+    nodes: list[WorkflowNode] = []
+    edges: list[WorkflowEdge] = []
+
+class WorkflowRunRequest(BaseModel):
+    workflow_id: str
+    input: str
+    variables: dict = {}
+    session_id: str = "default"
+
+# 内存存储工作流
+workflows: dict[str, dict] = {}
+
+@app.post("/workflow")
+async def create_workflow(data: WorkflowData):
+    wf_id = str(uuid.uuid4())[:8]
+    workflows[wf_id] = {
+        "id": wf_id,
+        "name": data.name,
+        "description": data.description,
+        "nodes": [n.model_dump() for n in data.nodes],
+        "edges": [e.model_dump() for e in data.edges],
+        "created_at": datetime.datetime.now().isoformat(),
+    }
+    return {"workflow_id": wf_id, "name": data.name}
+
+@app.get("/workflow")
+async def list_workflows():
+    return {"workflows": list(workflows.values())}
+
+@app.get("/workflow/{wf_id}")
+async def get_workflow(wf_id: str):
+    if wf_id not in workflows:
+        raise HTTPException(status_code=404, detail="工作流不存在")
+    return workflows[wf_id]
+
+@app.put("/workflow/{wf_id}")
+async def update_workflow(wf_id: str, data: WorkflowData):
+    if wf_id not in workflows:
+        raise HTTPException(status_code=404, detail="工作流不存在")
+    workflows[wf_id].update({
+        "name": data.name,
+        "description": data.description,
+        "nodes": [n.model_dump() for n in data.nodes],
+        "edges": [e.model_dump() for e in data.edges],
+    })
+    return {"workflow_id": wf_id}
+
+@app.delete("/workflow/{wf_id}")
+async def delete_workflow(wf_id: str):
+    if wf_id not in workflows:
+        raise HTTPException(status_code=404, detail="工作流不存在")
+    del workflows[wf_id]
+    return {"message": f"工作流 {wf_id} 已删除"}
+
+@app.post("/workflow/run")
+async def run_workflow(req: WorkflowRunRequest):
+    if req.workflow_id not in workflows:
+        raise HTTPException(status_code=404, detail="工作流不存在")
+    wf = workflows[req.workflow_id]
+    nodes = wf["nodes"]
+    edges = wf["edges"]
+
+    # 构建执行顺序（拓扑排序）
+    adj: dict[str, list[str]] = {}
+    for e in edges:
+        adj.setdefault(e["source"], []).append(e["target"])
+
+    # 找 start 节点
+    start_nodes = [n for n in nodes if n["type"] == "start"]
+    if not start_nodes:
+        raise HTTPException(status_code=400, detail="工作流缺少开始节点")
+
+    # 简单线性执行：按拓扑顺序执行 LLM/Tool/Knowledge 节点
+    visited = set()
+    queue = [start_nodes[0]["id"]]
+    execution_log = []
+    current_input = req.input
+    final_response = req.input
+
+    # 构建变量替换表：{{变量名}} → 值，同时支持 {{input}}
+    var_map = {k: str(v) for k, v in req.variables.items()}
+    var_map["input"] = req.input
+
+    def replace_vars(text: str) -> str:
+        for k, v in var_map.items():
+            text = text.replace("{{" + k + "}}", v)
+        return text
+
+    history = session_histories.get(req.session_id, [])
+    system = SYSTEM_PROMPT
+
+    while queue:
+        node_id = queue.pop(0)
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+
+        node = next((n for n in nodes if n["id"] == node_id), None)
+        if not node:
+            continue
+
+        ntype = node["type"]
+        cfg = node.get("config", {})
+
+        if ntype == "start":
+            execution_log.append({"node": node["label"], "type": "start", "output": current_input})
+
+        elif ntype == "llm":
+            prompt_prefix = replace_vars(cfg.get("system_prompt", ""))
+            var_map["input"] = current_input  # 更新 {{input}} 为当前输入
+            msgs = ([{"role": "system", "content": (prompt_prefix + "\n" + system).strip()}]
+                    + history
+                    + [{"role": "user", "content": current_input}])
+            resp_text, steps = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, cfg.get("model", "claude-sonnet-4-6"), msgs)
+            current_input = resp_text
+            final_response = resp_text
+            execution_log.append({"node": node["label"], "type": "llm", "output": resp_text, "steps": steps})
+
+        elif ntype == "tool":
+            tool_name = cfg.get("tool_name", "")
+            if tool_name in TOOL_FUNCTIONS:
+                tool_args = dict(cfg.get("args", {}))
+                var_map["input"] = current_input
+                for k, v in tool_args.items():
+                    if isinstance(v, str):
+                        tool_args[k] = replace_vars(v)
+                result = TOOL_FUNCTIONS[tool_name](**tool_args)
+                current_input = result
+                execution_log.append({"node": node["label"], "type": "tool", "output": result})
+
+        elif ntype == "knowledge":
+            kb_id = cfg.get("kb_id", "")
+            if kb_id and kb_id in knowledge_bases:
+                result = search_knowledge_base(kb_id, current_input)
+                current_input = f"知识库检索结果：\n{result}\n\n原始问题：{req.input}"
+                execution_log.append({"node": node["label"], "type": "knowledge", "output": result})
+
+        elif ntype == "condition":
+            expr = cfg.get("condition", "")
+            result = False
+            if ":" in expr:
+                op, val = expr.split(":", 1)
+                op = op.strip().lower()
+                val = val.strip()
+                text = current_input.lower()
+                if op == "contains":
+                    result = val.lower() in text
+                elif op == "equals":
+                    result = current_input.strip() == val
+                elif op == "startswith":
+                    result = text.startswith(val.lower())
+            branch = "true" if result else "false"
+            execution_log.append({"node": node["label"], "type": "condition", "output": f"条件: {expr} → {branch}"})
+            # 只走匹配分支的边
+            for e in edges:
+                if e["source"] == node_id and e.get("label", "").lower() == branch and e["target"] not in visited:
+                    queue.append(e["target"])
+            continue
+
+        elif ntype == "end":
+            execution_log.append({"node": node["label"], "type": "end", "output": final_response})
+
+        # 加入下一批节点
+        for next_id in adj.get(node_id, []):
+            if next_id not in visited:
+                queue.append(next_id)
+
+    # 更新会话历史
+    history.append({"role": "user", "content": req.input})
+    history.append({"role": "assistant", "content": final_response})
+    session_histories[req.session_id] = history[-20:]
+
+    return {
+        "response": final_response,
+        "execution_log": execution_log,
+        "session_id": req.session_id,
+    }
+
+
+# ==================== Agent API ====================
+
+class AgentData(BaseModel):
+    name: str
+    description: str = ""
+    agent_type: str = "multi_agent"  # "multi_agent" | "autonomous"
+    system_prompt: str = ""
+    model_name: str = "claude-sonnet-4-6"
+    greeting: str = ""
+    suggested_questions: list[str] = []
+    context_rounds: int = 2
+    # 多智能体协同
+    sub_agents: list[str] = []
+    collaboration_mode: str = "sequential"  # "sequential" | "parallel" | "debate"
+    # 自主规划
+    available_tools: list[str] = []
+    max_steps: int = 10
+
+class AgentChatRequest(BaseModel):
+    message: str
+    session_id: str = "default"
+
+agents: dict[str, dict] = {}
+
+@app.post("/agent")
+async def create_agent(data: AgentData):
+    if data.agent_type == "multi_agent":
+        for sid in data.sub_agents:
+            if sid not in agents:
+                raise HTTPException(status_code=400, detail=f"子 Agent {sid} 不存在")
+    agent_id = str(uuid.uuid4())[:8]
+    agents[agent_id] = {
+        "id": agent_id,
+        "name": data.name,
+        "description": data.description,
+        "agent_type": data.agent_type,
+        "system_prompt": data.system_prompt,
+        "model_name": data.model_name,
+        "greeting": data.greeting,
+        "suggested_questions": data.suggested_questions,
+        "context_rounds": data.context_rounds,
+        "sub_agents": data.sub_agents,
+        "collaboration_mode": data.collaboration_mode,
+        "available_tools": data.available_tools,
+        "max_steps": data.max_steps,
+        "created_at": datetime.datetime.now().isoformat(),
+    }
+    return {"agent_id": agent_id, "name": data.name}
+
+@app.get("/agent")
+async def list_agents():
+    return {"agents": list(agents.values())}
+
+@app.get("/agent/{agent_id}")
+async def get_agent(agent_id: str):
+    if agent_id not in agents:
+        raise HTTPException(status_code=404, detail="Agent 不存在")
+    return agents[agent_id]
+
+@app.put("/agent/{agent_id}")
+async def update_agent(agent_id: str, data: AgentData):
+    if agent_id not in agents:
+        raise HTTPException(status_code=404, detail="Agent 不存在")
+    agents[agent_id].update({
+        "name": data.name,
+        "description": data.description,
+        "agent_type": data.agent_type,
+        "system_prompt": data.system_prompt,
+        "model_name": data.model_name,
+        "greeting": data.greeting,
+        "suggested_questions": data.suggested_questions,
+        "context_rounds": data.context_rounds,
+        "sub_agents": data.sub_agents,
+        "collaboration_mode": data.collaboration_mode,
+        "available_tools": data.available_tools,
+        "max_steps": data.max_steps,
+    })
+    return {"agent_id": agent_id}
+
+@app.delete("/agent/{agent_id}")
+async def delete_agent(agent_id: str):
+    if agent_id not in agents:
+        raise HTTPException(status_code=404, detail="Agent 不存在")
+    del agents[agent_id]
+    return {"message": f"Agent {agent_id} 已删除"}
+
+
+# ── 多智能体协同执行引擎 ──
+
+def _call_sub_agent(sub_ag: dict, user_input: str, session_id: str) -> tuple[str, list]:
+    """调用单个子 agent，返回 (回复文本, 工具步骤)"""
+    system = sub_ag.get("system_prompt") or SYSTEM_PROMPT
+    history = session_histories.get(session_id, [])
+    messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_input}]
+    return run_agent(API_KEY, BASE_URL, sub_ag.get("model_name", "claude-sonnet-4-6"), messages)
+
+
+async def run_multi_agent_chat(ag: dict, user_input: str, session_id: str) -> dict:
+    sub_ids = ag.get("sub_agents", [])
+    mode = ag.get("collaboration_mode", "sequential")
+    valid_subs = [agents[sid] for sid in sub_ids if sid in agents]
+
+    # 没有子 agent 时，用主 agent 自身直接对话
+    if not valid_subs:
+        history = session_histories.get(session_id, [])
+        system = ag.get("system_prompt") or SYSTEM_PROMPT
+        messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_input}]
+        response_text, steps = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag.get("model_name", "claude-sonnet-4-6"), messages)
+        history.append({"role": "user", "content": user_input})
+        history.append({"role": "assistant", "content": response_text})
+        session_histories[session_id] = history[-20:]
+        return {"response": response_text, "steps": steps, "multi_agent_log": [], "session_id": session_id}
+
+    log = []
+
+    if mode == "sequential":
+        current_input = user_input
+        for sub in valid_subs:
+            text, steps = await asyncio.to_thread(_call_sub_agent, sub, current_input, session_id)
+            log.append({"agent_name": sub["name"], "agent_id": sub["id"], "input": current_input, "output": text, "steps": steps})
+            current_input = text
+        final = current_input
+
+    elif mode == "parallel":
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        tasks = [loop.run_in_executor(None, _call_sub_agent, sub, user_input, session_id) for sub in valid_subs]
+        results = await asyncio.gather(*tasks)
+        for sub, (text, steps) in zip(valid_subs, results):
+            log.append({"agent_name": sub["name"], "agent_id": sub["id"], "input": user_input, "output": text, "steps": steps})
+        # 用主 agent 汇总
+        summary_prompt = f"以下是多个 AI 助手对用户问题的回答，请综合所有回答给出最终答案。\n\n用户问题: {user_input}\n\n"
+        for entry in log:
+            summary_prompt += f"【{entry['agent_name']}】的回答:\n{entry['output']}\n\n"
+        system = ag.get("system_prompt") or "你是一个汇总助手，请综合多个助手的回答给出最终答案。"
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": summary_prompt}]
+        final, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], msgs)
+
+    elif mode == "debate":
+        # 第一轮：各自回答
+        round1 = {}
+        for sub in valid_subs:
+            text, steps = await asyncio.to_thread(_call_sub_agent, sub, user_input, session_id)
+            round1[sub["id"]] = text
+            log.append({"agent_name": sub["name"], "agent_id": sub["id"], "round": 1, "output": text, "steps": steps})
+        # 第二轮：看到其他人的观点后再回答
+        for sub in valid_subs:
+            others = "\n\n".join(f"【{agents[sid]['name']}】的观点: {round1[sid]}" for sid in round1 if sid != sub["id"])
+            debate_input = f"用户问题: {user_input}\n\n其他助手的观点:\n{others}\n\n请在看到其他观点后，给出你的最终回答。你可以坚持自己的观点，也可以修正。"
+            text, steps = await asyncio.to_thread(_call_sub_agent, sub, debate_input, session_id)
+            log.append({"agent_name": sub["name"], "agent_id": sub["id"], "round": 2, "output": text, "steps": steps})
+        # 主 agent 裁决
+        all_views = "\n\n".join(f"【{e['agent_name']}】(第{e['round']}轮): {e['output']}" for e in log)
+        judge_prompt = f"以下是多个助手经过两轮辩论后的观点。请作为裁判，综合所有观点给出最终结论。\n\n用户问题: {user_input}\n\n{all_views}"
+        system = ag.get("system_prompt") or "你是辩论裁判，请综合各方观点给出公正的最终结论。"
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": judge_prompt}]
+        final, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], msgs)
+    else:
+        final = "不支持的协作模式"
+
+    history = session_histories.get(session_id, [])
+    history.append({"role": "user", "content": user_input})
+    history.append({"role": "assistant", "content": final})
+    session_histories[session_id] = history[-20:]
+    return {"response": final, "steps": [], "multi_agent_log": log, "session_id": session_id}
+
+
+# ── 自主规划执行引擎 ──
+
+PLAN_PROMPT = """你是一个任务规划专家。请将用户的任务拆解为具体的执行步骤。
+你必须以 JSON 格式输出，格式如下：
+{"steps": [{"step": 1, "description": "步骤描述", "tool": "工具名称或null"}]}
+
+可用工具: {tools}
+
+注意：
+- 每个步骤应该是一个具体的、可执行的操作
+- tool 字段如果不需要工具则填 null
+- 步骤数量不要超过 {max_steps} 步
+- 只输出 JSON，不要输出其他内容"""
+
+REFLECT_PROMPT = """你是一个任务执行评估专家。请评估当前步骤的执行结果，判断是否需要调整后续计划。
+
+原始任务: {task}
+当前计划: {plan}
+已完成步骤: {completed}
+当前步骤结果: {current_result}
+
+请以 JSON 格式回答：
+{{"assessment": "对当前结果的评估", "need_replan": true/false, "reason": "原因"}}
+
+只输出 JSON。"""
+
+
+async def run_autonomous_chat(ag: dict, user_input: str, session_id: str) -> dict:
+    available = ag.get("available_tools", [])
+    max_steps = ag.get("max_steps", 10)
+    tool_names = ", ".join(available) if available else "无"
+    execution_log = []
+
+    # 1. 规划阶段
+    plan_system = PLAN_PROMPT.format(tools=tool_names, max_steps=max_steps)
+    plan_msgs = [{"role": "system", "content": plan_system}, {"role": "user", "content": user_input}]
+    plan_text, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], plan_msgs)
+
+    try:
+        # 提取 JSON（兼容 markdown code block）
+        clean = plan_text.strip()
+        if "```" in clean:
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+            clean = clean.strip()
+        plan = json.loads(clean)
+    except Exception:
+        plan = {"steps": [{"step": 1, "description": user_input, "tool": None}]}
+
+    execution_log.append({"phase": "plan", "content": plan})
+    steps_plan = plan.get("steps", [])
+    completed_results = []
+
+    # 2. 执行 + 反思循环
+    step_count = 0
+    i = 0
+    while i < len(steps_plan) and step_count < max_steps:
+        step_info = steps_plan[i]
+        step_desc = step_info.get("description", "")
+        step_tool = step_info.get("tool")
+
+        # 构建执行 prompt
+        context = "\n".join(f"步骤{j+1}结果: {r}" for j, r in enumerate(completed_results))
+        exec_prompt = f"请执行以下任务步骤:\n{step_desc}"
+        if context:
+            exec_prompt = f"之前步骤的结果:\n{context}\n\n{exec_prompt}"
+
+        system = ag.get("system_prompt") or SYSTEM_PROMPT
+        # 如果步骤指定了工具且在可用列表中，构建带工具的消息
+        tool_schemas = [t for t in TOOLS_SCHEMA if t["function"]["name"] in available] if available else TOOLS_SCHEMA
+        exec_msgs = [{"role": "system", "content": system}, {"role": "user", "content": exec_prompt}]
+
+        # 执行（带工具调用）
+        client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        exec_steps = []
+        for _ in range(5):
+            response = await asyncio.to_thread(
+                lambda: client.chat.completions.create(
+                    model=ag["model_name"], messages=exec_msgs,
+                    tools=tool_schemas if tool_schemas else None,
+                    tool_choice="auto" if tool_schemas else None,
+                )
+            )
+            msg = response.choices[0].message
+            if not msg.tool_calls:
+                step_result = msg.content
+                break
+            exec_msgs.append({
+                "role": "assistant", "content": msg.content or "",
+                "tool_calls": [{"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in msg.tool_calls]
+            })
+            for tc in msg.tool_calls:
+                fn = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments)
+                except Exception:
+                    args = {}
+                result = TOOL_FUNCTIONS[fn](**args) if fn in TOOL_FUNCTIONS else f"未知工具: {fn}"
+                exec_steps.append({"tool": fn, "input": args, "output": result})
+                exec_msgs.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+        else:
+            step_result = "步骤执行超时"
+
+        completed_results.append(step_result)
+        execution_log.append({
+            "phase": "execute", "step": step_info.get("step", i+1),
+            "description": step_desc, "result": step_result, "tool_steps": exec_steps
+        })
+
+        # 3. 反思阶段
+        reflect_system = REFLECT_PROMPT.format(
+            task=user_input, plan=json.dumps(steps_plan, ensure_ascii=False),
+            completed=json.dumps(completed_results, ensure_ascii=False), current_result=step_result
+        )
+        reflect_msgs = [{"role": "system", "content": reflect_system}, {"role": "user", "content": "请评估"}]
+        reflect_text, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], reflect_msgs)
+
+        try:
+            rclean = reflect_text.strip()
+            if "```" in rclean:
+                rclean = rclean.split("```")[1]
+                if rclean.startswith("json"):
+                    rclean = rclean[4:]
+                rclean = rclean.strip()
+            reflection = json.loads(rclean)
+        except Exception:
+            reflection = {"assessment": reflect_text, "need_replan": False, "reason": ""}
+
+        execution_log.append({"phase": "reflect", "step": step_info.get("step", i+1), "content": reflection})
+
+        # 4. 重规划
+        if reflection.get("need_replan"):
+            replan_prompt = f"原始任务: {user_input}\n已完成步骤结果: {json.dumps(completed_results, ensure_ascii=False)}\n反思: {reflection.get('reason', '')}\n\n请重新规划剩余步骤。"
+            replan_msgs = [{"role": "system", "content": plan_system}, {"role": "user", "content": replan_prompt}]
+            replan_text, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], replan_msgs)
+            try:
+                rp_clean = replan_text.strip()
+                if "```" in rp_clean:
+                    rp_clean = rp_clean.split("```")[1]
+                    if rp_clean.startswith("json"):
+                        rp_clean = rp_clean[4:]
+                    rp_clean = rp_clean.strip()
+                new_plan = json.loads(rp_clean)
+                steps_plan = new_plan.get("steps", [])
+                i = 0
+                execution_log.append({"phase": "replan", "content": new_plan})
+            except Exception:
+                i += 1
+        else:
+            i += 1
+        step_count += 1
+
+    # 最终汇总
+    summary_prompt = f"原始任务: {user_input}\n\n执行结果:\n" + "\n".join(f"步骤{j+1}: {r}" for j, r in enumerate(completed_results)) + "\n\n请给出最终的综合回答。"
+    system = ag.get("system_prompt") or SYSTEM_PROMPT
+    summary_msgs = [{"role": "system", "content": system}, {"role": "user", "content": summary_prompt}]
+    final, _ = await asyncio.to_thread(run_agent, API_KEY, BASE_URL, ag["model_name"], summary_msgs)
+
+    history = session_histories.get(session_id, [])
+    history.append({"role": "user", "content": user_input})
+    history.append({"role": "assistant", "content": final})
+    session_histories[session_id] = history[-20:]
+    return {"response": final, "steps": [], "autonomous_log": execution_log, "session_id": session_id}
+
+
+@app.post("/agent/{agent_id}/chat")
+async def agent_chat(agent_id: str, req: AgentChatRequest):
+    if agent_id not in agents:
+        raise HTTPException(status_code=404, detail="Agent 不存在")
+    ag = agents[agent_id]
+    atype = ag.get("agent_type", "multi_agent")
+
+    if atype == "multi_agent":
+        return await run_multi_agent_chat(ag, req.message, req.session_id)
+    elif atype == "autonomous":
+        return await run_autonomous_chat(ag, req.message, req.session_id)
+    else:
+        raise HTTPException(status_code=400, detail=f"不支持的 Agent 类型: {atype}")
 
 
 if __name__ == "__main__":
