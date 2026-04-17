@@ -321,6 +321,52 @@ def search_knowledge_base(kb_id: str, query: str, top_k: int = 3) -> str:
     return "\n\n---\n\n".join(results)
 
 
+def fetch_url(url: str, max_chars: int = 2000) -> str:
+    """抓取网页/JSON 正文，HTML 会剥标签。"""
+    if not re.match(r"^https?://", url):
+        return "url 必须以 http:// 或 https:// 开头"
+    if max_chars > 8000:
+        max_chars = 8000
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (AgentFlow)"})
+        with urllib.request.urlopen(req, timeout=15, context=_ssl_ctx) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            raw = resp.read(1024 * 1024)  # 最多 1MB
+            body = raw.decode(resp.headers.get_content_charset() or "utf-8", errors="replace")
+        # 简易 HTML→文本：去 script/style 再剥标签
+        if "html" in ctype.lower() or body.lstrip().startswith("<"):
+            body = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", body, flags=re.DOTALL | re.IGNORECASE)
+            body = re.sub(r"<[^>]+>", " ", body)
+            body = re.sub(r"\s+", " ", body).strip()
+        truncated = len(body) > max_chars
+        body = body[:max_chars]
+        return f"URL: {url}\nContent-Type: {ctype}\n\n{body}" + ("\n\n[... 已截断]" if truncated else "")
+    except Exception as e:
+        return f"抓取失败: {type(e).__name__}: {str(e)}"
+
+
+def web_search(query: str) -> str:
+    """用 DuckDuckGo Instant Answer API 免费搜索，无需 Key。"""
+    try:
+        params = urllib.parse.urlencode({"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
+        req = urllib.request.Request(f"https://api.duckduckgo.com/?{params}", headers={"User-Agent": "Mozilla/5.0 (AgentFlow)"})
+        with urllib.request.urlopen(req, timeout=10, context=_ssl_ctx) as resp:
+            data = json.loads(resp.read().decode())
+        parts = []
+        if data.get("AbstractText"):
+            parts.append(f"摘要: {data['AbstractText']}")
+        if data.get("AbstractURL"):
+            parts.append(f"来源: {data['AbstractURL']}")
+        related = [r.get("Text", "") for r in data.get("RelatedTopics", []) if isinstance(r, dict) and r.get("Text")]
+        if related:
+            parts.append("相关结果:\n" + "\n".join(f"- {r}" for r in related[:5]))
+        if not parts:
+            return f"没有直接答案。建议用 fetch_url 抓取具体网页。查询: {query}"
+        return "\n\n".join(parts)
+    except Exception as e:
+        return f"搜索失败: {type(e).__name__}: {str(e)}"
+
+
 # 工具分发表
 TOOL_FUNCTIONS = {
     "calculator": calculator,
@@ -329,6 +375,8 @@ TOOL_FUNCTIONS = {
     "unit_converter": unit_converter,
     "word_counter": word_counter,
     "get_weather": get_weather,
+    "fetch_url": fetch_url,
+    "web_search": web_search,
     "search_knowledge_base": search_knowledge_base,
 }
 
@@ -419,6 +467,35 @@ TOOLS_SCHEMA = [
                     "city": {"type": "string", "description": "城市名称，支持中文或英文，如 '北京'、'Shanghai'、'London'"}
                 },
                 "required": ["city"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "抓取任意 HTTP(S) URL 的正文内容。HTML 会自动剥标签并压缩空白；JSON/纯文本原样返回。超过 max_chars 会截断。用于读文章/API/在线文档。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "目标 URL，必须以 http:// 或 https:// 开头"},
+                    "max_chars": {"type": "integer", "description": "返回正文最大字符数，默认 2000，上限 8000", "default": 2000}
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "用 DuckDuckGo 搜索网络信息，返回摘要和相关主题。适合快速查概念/时事/知识问答，无需 API Key。若需完整正文请用 fetch_url。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词或自然语言问题"}
+                },
+                "required": ["query"]
             }
         }
     },
@@ -539,6 +616,21 @@ class ChatRequest(_WithCreds):
 @app.get("/health")
 async def health():
     return {"status": "ok", "message": "Agent is running"}
+
+
+class LoginRequest(BaseModel):
+    password: str
+
+
+@app.post("/auth/login")
+async def auth_login(req: LoginRequest):
+    """后端校验密码，密码从 AGENT_LOGIN_PASSWORD 环境变量读，未设置则用默认值。"""
+    expected = os.getenv("AGENT_LOGIN_PASSWORD", "agent2024")
+    if req.password == expected:
+        logger.info("登录成功")
+        return {"ok": True}
+    logger.warning("登录失败：密码不匹配")
+    raise HTTPException(status_code=401, detail="密码错误")
 
 
 @app.get("/tools")
