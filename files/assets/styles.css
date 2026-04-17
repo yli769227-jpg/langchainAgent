@@ -222,6 +222,7 @@ body::before {
   padding: 32px;
   gap: 24px;
 }
+#page-home > * { flex-shrink: 0; }
 .home-hero {
   background: linear-gradient(135deg, rgba(26,107,255,0.08) 0%, rgba(13,82,214,0.04) 100%);
   border: 1px solid rgba(26,107,255,0.15);
@@ -245,8 +246,10 @@ body::before {
   background: linear-gradient(135deg, var(--text) 0%, var(--accent) 100%);
   -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
 }
-.home-hero-sub { font-size: 14px; color: var(--text2); margin-bottom: 20px; line-height: 1.6; }
-.home-hero-actions { display: flex; gap: 10px; }
+.home-hero-sub { font-size: 14px; color: var(--text2); margin-bottom: 24px; line-height: 1.6; }
+.home-hero-actions { display: flex; gap: 12px; position: relative; z-index: 1; }
+.home-hero-actions .btn { padding: 10px 20px; font-size: 14px; }
+.home-hero-actions .btn svg { width: 15px; height: 15px; }
 .home-stats {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
