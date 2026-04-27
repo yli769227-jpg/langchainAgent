@@ -119,7 +119,7 @@ Stars appreciated 🙏
 
 ---
 
-## 4. LangChain 中文社区(微信群/Discord/飞书群)模板
+## 4. LangChain 中文社区(微信群/Discord)模板
 
 ```
 【开源】LangChain Agent 中文优化版
