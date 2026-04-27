@@ -1,7 +1,17 @@
 # LangChain Agent
 
+[![GitHub stars](https://img.shields.io/github/stars/yli769227-jpg/langchainAgent?style=social)](https://github.com/yli769227-jpg/langchainAgent/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/yli769227-jpg/langchainAgent?style=social)](https://github.com/yli769227-jpg/langchainAgent/network/members)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![LangChain](https://img.shields.io/badge/LangChain-1.2-1C3C3C.svg?logo=langchain&logoColor=white)](https://github.com/langchain-ai/langchain)
+[![LangGraph](https://img.shields.io/badge/LangGraph-1.1-FF6B6B.svg)](https://github.com/langchain-ai/langgraph)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Tests](https://img.shields.io/badge/tests-40_passed-brightgreen.svg)](./files/tests)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/yli769227-jpg/langchainAgent/pulls)
+
 基于 **LangChain 1.2 + LangGraph 1.1 + FastAPI** 的全栈智能 Agent。
-**真接入** LangChain 状态机栈，工具用 `@tool` 装饰，schema 自动派生，
+**真接入** LangChain 状态机栈,工具用 `@tool` 装饰,schema 自动派生,
 无任何手写 OpenAI 工具循环。
 
 ## 技术栈
@@ -176,3 +186,18 @@ TOOLS = [..., my_tool]
   零额外代码。
 - **为什么保留 `TOOLS_SCHEMA` / `TOOL_FUNCTIONS` 兼容字段？** workflow / agent
   模块的旧调用路径用了它们；改成自动派生但接口不动，最小化破坏面。
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=yli769227-jpg/langchainAgent&type=Date)](https://star-history.com/#yli769227-jpg/langchainAgent&Date)
+
+## License
+
+MIT — see [LICENSE](../LICENSE).
+
+## Contributing
+
+PR / Issue 欢迎。提 PR 前请:
+1. 跑通 `pytest tests/`(目前 40 个测试)
+2. 加测试覆盖你的新工具 / 新功能
+3. 在 README "工具" 表里登记新工具
