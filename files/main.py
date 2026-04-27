@@ -1,7 +1,11 @@
 """
 LangChain Agent Backend - FastAPI
-手动工具调用循环实现，兼容第三方/中转 OpenAI 格式接口
-不依赖 LangGraph，避免 model_dump / tool_calls 格式兼容问题
+
+真接入 LangChain 1.2 + LangGraph 1.1 栈：
+- 工具用 @tool 装饰，schema 自动派生
+- run_agent 走 langchain.agents.create_agent (LangGraph 状态机)
+- /chat/stream 用 agent.astream_events 流式
+- 兼容第三方/中转 OpenAI 格式接口（任意 base_url）
 """
 
 import os
@@ -21,6 +25,12 @@ import asyncio
 import urllib.request
 import urllib.parse
 import ssl
+
+# LangChain / LangGraph 栈
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_openai import ChatOpenAI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,9 +55,7 @@ if os.getenv("AGENT_INSECURE_SSL") == "1":
     _ssl_ctx.verify_mode = ssl.CERT_NONE
     logger.warning("SSL 证书验证已关闭 (AGENT_INSECURE_SSL=1)")
 
-from openai import OpenAI
-
-app = FastAPI(title="LangChain Agent API", version="1.0.0")
+app = FastAPI(title="LangChain Agent API", version="2.0.0")
 
 # CORS 白名单：允许本地开发 + file:// 打开前端
 _allowed_origin_re = re.compile(r"^(https?://localhost(:\d+)?|https?://127\.0\.0\.1(:\d+)?|null)$")
@@ -110,7 +118,13 @@ def _calc_eval(node, depth: int = 0):
     raise ValueError(f"不允许的语法: {type(node).__name__}")
 
 
+@tool
 def calculator(expression: str) -> str:
+    """执行数学计算。支持基本四则运算、幂运算、三角函数、对数等。示例: '2 + 3 * 4', 'sqrt(16)'。
+
+    Args:
+        expression: 数学表达式字符串
+    """
     if len(expression) > 500:
         return "计算错误: 表达式过长（上限 500 字符）"
     try:
@@ -121,7 +135,13 @@ def calculator(expression: str) -> str:
         return f"计算错误: {str(e)}"
 
 
+@tool
 def get_current_time(timezone: str = "Asia/Shanghai") -> str:
+    """获取当前日期和时间（北京时间）。
+
+    Args:
+        timezone: 时区，默认 Asia/Shanghai
+    """
     now = datetime.datetime.now()
     return (
         f"当前时间（北京时间）: {now.strftime('%Y年%m月%d日 %H:%M:%S')}\n"
@@ -130,7 +150,13 @@ def get_current_time(timezone: str = "Asia/Shanghai") -> str:
     )
 
 
+@tool
 def text_analyzer(text: str) -> str:
+    """分析文本统计信息：字符数、词数、行数、中文字符数等。
+
+    Args:
+        text: 要分析的文本
+    """
     lines = text.split('\n')
     words = text.split()
     chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
@@ -144,7 +170,15 @@ def text_analyzer(text: str) -> str:
     )
 
 
+@tool
 def unit_converter(value: float, from_unit: str, to_unit: str) -> str:
+    """单位换算。支持长度(m,km,mile,ft,cm,mm)、重量(kg,lb,g,oz)、温度(celsius,fahrenheit,kelvin)。
+
+    Args:
+        value: 要换算的数值
+        from_unit: 原单位
+        to_unit: 目标单位
+    """
     conversions = {
         ("m", "km"): 0.001,         ("km", "m"): 1000,
         ("m", "mile"): 0.000621371, ("mile", "m"): 1609.34,
@@ -175,12 +209,25 @@ def unit_converter(value: float, from_unit: str, to_unit: str) -> str:
     return f"{value} {from_unit} = {result:.4f} {to_unit}"
 
 
+@tool
 def word_counter(text: str, target_word: str) -> str:
+    """在文本中统计特定词语出现的次数（不区分大小写）。
+
+    Args:
+        text: 要搜索的文本
+        target_word: 要统计的词语
+    """
     count = text.lower().count(target_word.lower())
     return f"词语 '{target_word}' 在文本中出现了 {count} 次"
 
 
+@tool
 def get_weather(city: str) -> str:
+    """查询指定城市的实时天气，包括温度、湿度、风速、天气状况等。
+
+    Args:
+        city: 城市名称，支持中文或英文，如 '北京'、'Shanghai'、'London'
+    """
     try:
         # 第一步：用 open-meteo geocoding API 将城市名转为经纬度
         encoded_city = urllib.parse.quote(city)
@@ -287,7 +334,15 @@ def _cosine(a: list, b: list) -> float:
     return dot  # 已 normalize，dot == cosine
 
 
+@tool
 def search_knowledge_base(kb_id: str, query: str, top_k: int = 3) -> str:
+    """在指定知识库中搜索相关内容，用于回答基于知识库的问题。
+
+    Args:
+        kb_id: 知识库 ID
+        query: 搜索查询内容
+        top_k: 返回最相关的文档数量，默认 3
+    """
     if kb_id not in knowledge_bases:
         return f"知识库 {kb_id} 不存在"
     kb = knowledge_bases[kb_id]
@@ -321,8 +376,14 @@ def search_knowledge_base(kb_id: str, query: str, top_k: int = 3) -> str:
     return "\n\n---\n\n".join(results)
 
 
+@tool
 def fetch_url(url: str, max_chars: int = 2000) -> str:
-    """抓取网页/JSON 正文，HTML 会剥标签。"""
+    """抓取任意 HTTP(S) URL 的正文内容。HTML 会自动剥标签并压缩空白；JSON/纯文本原样返回。超过 max_chars 会截断。用于读文章/API/在线文档。
+
+    Args:
+        url: 目标 URL，必须以 http:// 或 https:// 开头
+        max_chars: 返回正文最大字符数，默认 2000，上限 8000
+    """
     if not re.match(r"^https?://", url):
         return "url 必须以 http:// 或 https:// 开头"
     if max_chars > 8000:
@@ -345,8 +406,13 @@ def fetch_url(url: str, max_chars: int = 2000) -> str:
         return f"抓取失败: {type(e).__name__}: {str(e)}"
 
 
+@tool
 def web_search(query: str) -> str:
-    """用 DuckDuckGo Instant Answer API 免费搜索，无需 Key。"""
+    """用 DuckDuckGo 搜索网络信息，返回摘要和相关主题。适合快速查概念/时事/知识问答，无需 API Key。若需完整正文请用 fetch_url。
+
+    Args:
+        query: 搜索关键词或自然语言问题
+    """
     try:
         params = urllib.parse.urlencode({"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
         req = urllib.request.Request(f"https://api.duckduckgo.com/?{params}", headers={"User-Agent": "Mozilla/5.0 (AgentFlow)"})
@@ -367,155 +433,31 @@ def web_search(query: str) -> str:
         return f"搜索失败: {type(e).__name__}: {str(e)}"
 
 
-# 工具分发表
-TOOL_FUNCTIONS = {
-    "calculator": calculator,
-    "get_current_time": get_current_time,
-    "text_analyzer": text_analyzer,
-    "unit_converter": unit_converter,
-    "word_counter": word_counter,
-    "get_weather": get_weather,
-    "fetch_url": fetch_url,
-    "web_search": web_search,
-    "search_knowledge_base": search_knowledge_base,
-}
+# ==================== LangChain 工具注册 ====================
 
-# ==================== OpenAI tools 格式定义 ====================
-
-TOOLS_SCHEMA = [
-    {
-        "type": "function",
-        "function": {
-            "name": "calculator",
-            "description": "执行数学计算。支持基本四则运算、幂运算、三角函数、对数等。示例: '2 + 3 * 4', 'sqrt(16)'",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {"type": "string", "description": "数学表达式字符串"}
-                },
-                "required": ["expression"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_current_time",
-            "description": "获取当前日期和时间（北京时间）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "timezone": {"type": "string", "description": "时区，默认 Asia/Shanghai"}
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "text_analyzer",
-            "description": "分析文本统计信息：字符数、词数、行数、中文字符数等",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "要分析的文本"}
-                },
-                "required": ["text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "unit_converter",
-            "description": "单位换算。支持长度(m,km,mile,ft,cm,mm)、重量(kg,lb,g,oz)、温度(celsius,fahrenheit,kelvin)",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "value": {"type": "number", "description": "要换算的数值"},
-                    "from_unit": {"type": "string", "description": "原单位"},
-                    "to_unit": {"type": "string", "description": "目标单位"}
-                },
-                "required": ["value", "from_unit", "to_unit"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "word_counter",
-            "description": "在文本中统计特定词语出现的次数（不区分大小写）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "要搜索的文本"},
-                    "target_word": {"type": "string", "description": "要统计的词语"}
-                },
-                "required": ["text", "target_word"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "查询指定城市的实时天气，包括温度、湿度、风速、天气状况等",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string", "description": "城市名称，支持中文或英文，如 '北京'、'Shanghai'、'London'"}
-                },
-                "required": ["city"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fetch_url",
-            "description": "抓取任意 HTTP(S) URL 的正文内容。HTML 会自动剥标签并压缩空白；JSON/纯文本原样返回。超过 max_chars 会截断。用于读文章/API/在线文档。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "目标 URL，必须以 http:// 或 https:// 开头"},
-                    "max_chars": {"type": "integer", "description": "返回正文最大字符数，默认 2000，上限 8000", "default": 2000}
-                },
-                "required": ["url"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "用 DuckDuckGo 搜索网络信息，返回摘要和相关主题。适合快速查概念/时事/知识问答，无需 API Key。若需完整正文请用 fetch_url。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "搜索关键词或自然语言问题"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_knowledge_base",
-            "description": "在指定知识库中搜索相关内容，用于回答基于知识库的问题",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "kb_id": {"type": "string", "description": "知识库 ID"},
-                    "query": {"type": "string", "description": "搜索查询内容"},
-                    "top_k": {"type": "integer", "description": "返回最相关的文档数量，默认 3", "default": 3}
-                },
-                "required": ["kb_id", "query"]
-            }
-        }
-    }
+# 所有 @tool 装饰的工具集中注册
+TOOLS = [
+    calculator,
+    get_current_time,
+    text_analyzer,
+    unit_converter,
+    word_counter,
+    get_weather,
+    search_knowledge_base,
+    fetch_url,
+    web_search,
 ]
+
+
+def _tools_to_openai_schema(tools: list) -> list:
+    """从 @tool 装饰的函数列表派生 OpenAI tools 格式 schema list（兼容旧调用方）。"""
+    return [convert_to_openai_tool(t) for t in tools]
+
+
+# 兼容性导出：原代码引用 TOOLS_SCHEMA / TOOL_FUNCTIONS 的地方继续可用
+# 注意：TOOL_FUNCTIONS 的值是 LangChain Tool 对象，调用时必须用 .invoke(args_dict) 而不是 (**kwargs)
+TOOLS_SCHEMA = _tools_to_openai_schema(TOOLS)
+TOOL_FUNCTIONS = {t.name: t for t in TOOLS}
 
 SYSTEM_PROMPT = """你是一个智能助手。请根据用户的问题给出准确、有用的回答。
 回答时请用中文，并保持友好、专业的语气。
@@ -525,75 +467,76 @@ SYSTEM_PROMPT = """你是一个智能助手。请根据用户的问题给出准�
 session_histories: dict[str, list] = {}
 
 
-def run_agent(api_key: str, base_url: str, model_name: str, messages: list) -> tuple[str, list]:
+def _build_chat_model(api_key: str, base_url: str, model_name: str, **kwargs):
+    """构造 ChatOpenAI 客户端，统一从此入口便于 mock。"""
+    return ChatOpenAI(api_key=api_key, base_url=base_url, model=model_name, **kwargs)
+
+
+def _extract_steps_from_messages(messages: list) -> list:
+    """从 LangGraph 返回的 messages 列表里提取 [{tool, input, output}] 步骤。
+
+    LangChain 消息流约定：AIMessage 带 tool_calls -> 后续 ToolMessage 用 tool_call_id 关联。
     """
-    手动工具调用循环，完全基于原生 OpenAI SDK。
-    兼容所有支持 OpenAI 格式的中转服务。
-    返回 (最终回复文本, 工具调用步骤列表)
-    """
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    # 先把所有 ToolMessage 按 tool_call_id 索引
+    tool_results = {}
+    for m in messages:
+        if type(m).__name__ == "ToolMessage":
+            tcid = getattr(m, "tool_call_id", None)
+            if tcid:
+                tool_results[tcid] = str(getattr(m, "content", ""))
+
     steps = []
-    # 最多循环 10 次，防止死循环
-    for _ in range(10):
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            tools=TOOLS_SCHEMA,
-            tool_choice="auto",
-        )
-
-        msg = response.choices[0].message
-
-        # 没有工具调用，直接返回
-        if not msg.tool_calls:
-            return msg.content, steps
-
-        # 有工具调用，逐个执行
-        # 把 assistant 消息加入历史
-        messages.append({
-            "role": "assistant",
-            "content": msg.content or "",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    }
-                }
-                for tc in msg.tool_calls
-            ]
-        })
-
-        for tc in msg.tool_calls:
-            func_name = tc.function.name
-            try:
-                func_args = json.loads(tc.function.arguments)
-            except Exception:
-                func_args = {}
-
-            # 执行工具
-            if func_name in TOOL_FUNCTIONS:
-                tool_result = TOOL_FUNCTIONS[func_name](**func_args)
+    for m in messages:
+        tool_calls = getattr(m, "tool_calls", None)
+        if not tool_calls:
+            continue
+        for tc in tool_calls:
+            # tool_calls 是 dict 列表，形如 {'name':..., 'args':..., 'id':...}
+            if isinstance(tc, dict):
+                name = tc.get("name", "")
+                args = tc.get("args", {}) or {}
+                tcid = tc.get("id", "")
             else:
-                tool_result = f"未知工具: {func_name}"
-
+                name = getattr(tc, "name", "")
+                args = getattr(tc, "args", {}) or {}
+                tcid = getattr(tc, "id", "")
             steps.append({
-                "tool": func_name,
-                "input": func_args,
-                "output": tool_result,
+                "tool": name,
+                "input": args,
+                "output": tool_results.get(tcid, ""),
             })
+    return steps
 
-            # 把工具结果加入历史
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": tool_result,
-            })
 
-    # 超过最大循环次数，强制返回
-    return "抱歉，处理过程中遇到了问题，请重试。", steps
+def run_agent(api_key: str, base_url: str, model_name: str, messages: list) -> tuple[str, list]:
+    """用 LangChain create_agent + LangGraph 执行 ReAct 循环。
+
+    签名/返回不变（兼容原调用方）：
+        返回 (最终回复文本, [{"tool":..., "input":..., "output":...}])
+    """
+    logger.info("[run_agent] 启动 LangGraph agent model=%s base=%s msgs=%d",
+                model_name, base_url, len(messages))
+    model = _build_chat_model(api_key, base_url, model_name)
+    agent = create_agent(model=model, tools=TOOLS)
+
+    try:
+        result = agent.invoke(
+            {"messages": messages},
+            config={"recursion_limit": 25},
+        )
+    except Exception as e:
+        logger.exception("[run_agent] LangGraph invoke 异常: %s", e)
+        return f"抱歉，处理过程中遇到了问题：{type(e).__name__}: {e}", []
+
+    out_msgs = result.get("messages", [])
+    final_text = ""
+    if out_msgs:
+        last = out_msgs[-1]
+        final_text = getattr(last, "content", "") or ""
+
+    steps = _extract_steps_from_messages(out_msgs)
+    logger.info("[run_agent] 完成 final_len=%d steps=%d", len(final_text), len(steps))
+    return final_text, steps
 
 
 # ==================== API Models ====================
@@ -706,80 +649,66 @@ async def chat_stream(req: ChatRequest):
     )
 
     async def generate():
-        client = OpenAI(api_key=req.api_key, base_url=req.base_url)
-        steps = []
-        for _ in range(10):
-            stream = client.chat.completions.create(
-                model=req.model_name,
-                messages=messages,
-                tools=TOOLS_SCHEMA,
-                tool_choice="auto",
-                stream=True,
-            )
-            content_parts = []
-            tool_calls_map = {}
-            for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if not delta:
-                    continue
-                if delta.content:
-                    content_parts.append(delta.content)
-                    yield f"data: {json.dumps({'type':'token','content':delta.content}, ensure_ascii=False)}\n\n"
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls_map:
-                            tool_calls_map[idx] = {"id": tc.id or "", "name": "", "arguments": ""}
-                        if tc.id:
-                            tool_calls_map[idx]["id"] = tc.id
-                        if tc.function:
-                            if tc.function.name:
-                                tool_calls_map[idx]["name"] = tc.function.name
-                            if tc.function.arguments:
-                                tool_calls_map[idx]["arguments"] += tc.function.arguments
+        logger.info("[chat/stream] 启动 LangGraph 流式 agent session=%s", req.session_id)
+        model = _build_chat_model(req.api_key, req.base_url, req.model_name, streaming=True)
+        agent = create_agent(model=model, tools=TOOLS)
 
-            full_content = "".join(content_parts)
+        steps: list = []
+        final_text_parts: list = []
 
-            if not tool_calls_map:
-                # No tool calls, done
-                history.append({"role": "user", "content": req.message})
-                history.append({"role": "assistant", "content": full_content})
-                session_histories[req.session_id] = history[-20:]
-                yield f"data: {json.dumps({'type':'done','steps':steps}, ensure_ascii=False)}\n\n"
-                return
+        try:
+            async for event in agent.astream_events(
+                {"messages": messages},
+                version="v2",
+                config={"recursion_limit": 25},
+            ):
+                kind = event.get("event")
+                data = event.get("data", {}) or {}
 
-            # Process tool calls
-            assistant_msg = {
-                "role": "assistant",
-                "content": full_content or "",
-                "tool_calls": [
-                    {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
-                    for tc in tool_calls_map.values()
-                ]
-            }
-            messages.append(assistant_msg)
+                if kind == "on_chat_model_stream":
+                    chunk = data.get("chunk")
+                    content = getattr(chunk, "content", "") if chunk is not None else ""
+                    # content 可能是 str 或 list[dict] (Anthropic 风格)
+                    if isinstance(content, list):
+                        text = "".join(seg.get("text", "") for seg in content if isinstance(seg, dict) and seg.get("type") == "text")
+                    else:
+                        text = content or ""
+                    if text:
+                        final_text_parts.append(text)
+                        yield f"data: {json.dumps({'type':'token','content':text}, ensure_ascii=False)}\n\n"
 
-            for tc in tool_calls_map.values():
-                func_name = tc["name"]
-                try:
-                    func_args = json.loads(tc["arguments"])
-                except Exception:
-                    func_args = {}
-                if func_name in TOOL_FUNCTIONS:
-                    tool_result = TOOL_FUNCTIONS[func_name](**func_args)
-                else:
-                    tool_result = f"未知工具: {func_name}"
-                step = {"tool": func_name, "input": func_args, "output": tool_result}
-                steps.append(step)
-                yield f"data: {json.dumps({'type':'tool','step':step}, ensure_ascii=False)}\n\n"
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": tool_result})
+                elif kind == "on_tool_end":
+                    tool_name = event.get("name", "")
+                    tool_input = data.get("input", {}) or {}
+                    raw_output = data.get("output")
+                    # output 可能是 ToolMessage 对象，取 content
+                    tool_output = getattr(raw_output, "content", raw_output)
+                    tool_output = str(tool_output) if tool_output is not None else ""
+                    step = {"tool": tool_name, "input": tool_input, "output": tool_output}
+                    steps.append(step)
+                    logger.info("[chat/stream] 工具调用 tool=%s input=%s out_len=%d", tool_name, tool_input, len(tool_output))
+                    yield f"data: {json.dumps({'type':'tool','step':step}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logger.exception("[chat/stream] astream_events 异常: %s", e)
+            err = f"流式处理异常：{type(e).__name__}: {e}"
+            yield f"data: {json.dumps({'type':'token','content':err}, ensure_ascii=False)}\n\n"
 
+        full = "".join(final_text_parts)
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": full})
+        session_histories[req.session_id] = history[-20:]
+        logger.info("[chat/stream] 完成 final_len=%d steps=%d", len(full), len(steps))
         yield f"data: {json.dumps({'type':'done','steps':steps}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.delete("/chat/history/{session_id}")
 async def clear_history(session_id: str):
+    """清空指定会话的历史。"""
     if session_id in session_histories:
         del session_histories[session_id]
+        logger.info("[clear_history] session=%s 已清空", session_id)
     return {"message": f"Session {session_id} cleared"}
 
 
@@ -987,14 +916,16 @@ async def run_workflow(req: WorkflowRunRequest):
                 for k, v in tool_args.items():
                     if isinstance(v, str):
                         tool_args[k] = replace_vars(v)
-                result = TOOL_FUNCTIONS[tool_name](**tool_args)
+                # LangChain Tool: 用 .invoke(args_dict) 而非 (**kwargs)
+                result = TOOL_FUNCTIONS[tool_name].invoke(tool_args)
                 current_input = result
                 execution_log.append({"node": node["label"], "type": "tool", "output": result})
 
         elif ntype == "knowledge":
             kb_id = cfg.get("kb_id", "")
             if kb_id and kb_id in knowledge_bases:
-                result = search_knowledge_base(kb_id, current_input)
+                # LangChain Tool: 用 .invoke 派发
+                result = search_knowledge_base.invoke({"kb_id": kb_id, "query": current_input})
                 current_input = f"知识库检索结果：\n{result}\n\n原始问题：{req.input}"
                 execution_log.append({"node": node["label"], "type": "knowledge", "output": result})
 
@@ -1065,7 +996,7 @@ class AgentChatRequest(_WithCreds):
 agents: dict[str, dict] = {}
 
 @app.post("/agent")
-async def create_agent(data: AgentData):
+async def create_agent_endpoint(data: AgentData):
     if data.agent_type == "multi_agent":
         for sid in data.sub_agents:
             if sid not in agents:
@@ -1276,40 +1207,25 @@ async def run_autonomous_chat(ag: dict, user_input: str, session_id: str, api_ke
             exec_prompt = f"之前步骤的结果:\n{context}\n\n{exec_prompt}"
 
         system = ag.get("system_prompt") or SYSTEM_PROMPT
-        # 如果步骤指定了工具且在可用列表中，构建带工具的消息
-        tool_schemas = [t for t in TOOLS_SCHEMA if t["function"]["name"] in available] if available else TOOLS_SCHEMA
+        # 工具白名单：步骤可用工具子集（available 为空则放开全部）
+        allowed_tools = [t for t in TOOLS if t.name in available] if available else TOOLS
         exec_msgs = [{"role": "system", "content": system}, {"role": "user", "content": exec_prompt}]
 
-        # 执行（带工具调用）
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        exec_steps = []
-        for _ in range(5):
-            response = await asyncio.to_thread(
-                lambda: client.chat.completions.create(
-                    model=ag["model_name"], messages=exec_msgs,
-                    tools=tool_schemas if tool_schemas else None,
-                    tool_choice="auto" if tool_schemas else None,
-                )
-            )
-            msg = response.choices[0].message
-            if not msg.tool_calls:
-                step_result = msg.content
-                break
-            exec_msgs.append({
-                "role": "assistant", "content": msg.content or "",
-                "tool_calls": [{"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in msg.tool_calls]
-            })
-            for tc in msg.tool_calls:
-                fn = tc.function.name
-                try:
-                    args = json.loads(tc.function.arguments)
-                except Exception:
-                    args = {}
-                result = TOOL_FUNCTIONS[fn](**args) if fn in TOOL_FUNCTIONS else f"未知工具: {fn}"
-                exec_steps.append({"tool": fn, "input": args, "output": result})
-                exec_msgs.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-        else:
-            step_result = "步骤执行超时"
+        # 执行：直接复用 LangGraph create_agent，避免再造轮子
+        def _run_step():
+            model = _build_chat_model(api_key, base_url, ag["model_name"])
+            sub_agent = create_agent(model=model, tools=allowed_tools)
+            return sub_agent.invoke({"messages": exec_msgs}, config={"recursion_limit": 10})
+
+        try:
+            sub_result = await asyncio.to_thread(_run_step)
+            sub_msgs = sub_result.get("messages", [])
+            step_result = getattr(sub_msgs[-1], "content", "") if sub_msgs else ""
+            exec_steps = _extract_steps_from_messages(sub_msgs)
+        except Exception as e:
+            logger.exception("[autonomous] 步骤执行异常: %s", e)
+            step_result = f"步骤执行失败: {type(e).__name__}: {e}"
+            exec_steps = []
 
         completed_results.append(step_result)
         execution_log.append({
