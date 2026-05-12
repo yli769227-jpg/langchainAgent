@@ -1147,7 +1147,8 @@ def _call_sub_agent(sub_ag: dict, user_input: str, session_id: str, api_key: str
     """
     system = sub_ag.get("system_prompt") or SYSTEM_PROMPT
     history = session_histories.get(session_id, [])
-    messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_input}]
+    # system_prompt 走 create_deep_agent(system_prompt=...) 注入,messages 不再 prepend system 避免重复。
+    messages = list(history) + [{"role": "user", "content": user_input}]
     model_name = sub_ag.get("model_name", "claude-sonnet-4-6")
 
     trace_cfg = _langsmith_config(
@@ -1286,11 +1287,9 @@ async def run_autonomous_chat(ag: dict, user_input: str, session_id: str, api_ke
     system = ag.get("system_prompt") or SYSTEM_PROMPT
 
     history = session_histories.get(session_id, [])
-    messages = (
-        [{"role": "system", "content": system}]
-        + history
-        + [{"role": "user", "content": user_input}]
-    )
+    # 注意: system_prompt 已经通过 _build_deep_agent → create_deep_agent(system_prompt=...) 注入,
+    # messages 里不要再 prepend system,否则会和 SDK 默认 prompt 一起重复传给模型。
+    messages = list(history) + [{"role": "user", "content": user_input}]
 
     trace_cfg = _langsmith_config(
         run_name=f"deep_agent:{ag.get('name','autonomous')}",

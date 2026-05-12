@@ -26,8 +26,7 @@ def _fake(*responses):
 
 def test_build_deep_agent_returns_compiled_graph():
     fake = _fake(AIMessage(content="ok"))
-    agent = main._build_deep_agent.__wrapped__ if hasattr(main._build_deep_agent, "__wrapped__") else None
-    # 不真的 build(会 import 真 ChatOpenAI),改 mock _build_chat_model 路径
+    # mock _build_chat_model 避免真的去连 OpenAI endpoint
     with patch("main._build_chat_model", return_value=fake):
         graph = main._build_deep_agent("k", "u", "m", list(main.TOOLS), "sys")
     assert type(graph).__name__ == "CompiledStateGraph"
