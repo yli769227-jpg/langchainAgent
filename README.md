@@ -3,11 +3,12 @@
 [![GitHub stars](https://img.shields.io/github/stars/yli769227-jpg/langchainAgent?style=social)](https://github.com/yli769227-jpg/langchainAgent/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/yli769227-jpg/langchainAgent?style=social)](https://github.com/yli769227-jpg/langchainAgent/network/members)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![LangChain](https://img.shields.io/badge/LangChain-1.2-1C3C3C.svg?logo=langchain&logoColor=white)](https://github.com/langchain-ai/langchain)
 [![LangGraph](https://img.shields.io/badge/LangGraph-1.1-FF6B6B.svg)](https://github.com/langchain-ai/langgraph)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-40_passed-brightgreen.svg)](./files/tests)
+[![DeepAgents](https://img.shields.io/badge/DeepAgents-0.5-FF9966.svg)](https://github.com/langchain-ai/deepagents)
+[![Tests](https://img.shields.io/badge/tests-53_passed-brightgreen.svg)](./files/tests)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/yli769227-jpg/langchainAgent/pulls)
 
 基于 **LangChain 1.2 + LangGraph 1.1 + FastAPI** 的全栈智能 Agent。
