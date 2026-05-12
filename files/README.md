@@ -3,11 +3,12 @@
 [![GitHub stars](https://img.shields.io/github/stars/yli769227-jpg/langchainAgent?style=social)](https://github.com/yli769227-jpg/langchainAgent/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/yli769227-jpg/langchainAgent?style=social)](https://github.com/yli769227-jpg/langchainAgent/network/members)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![LangChain](https://img.shields.io/badge/LangChain-1.2-1C3C3C.svg?logo=langchain&logoColor=white)](https://github.com/langchain-ai/langchain)
 [![LangGraph](https://img.shields.io/badge/LangGraph-1.1-FF6B6B.svg)](https://github.com/langchain-ai/langgraph)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-40_passed-brightgreen.svg)](./files/tests)
+[![Tests](https://img.shields.io/badge/tests-53_passed-brightgreen.svg)](./files/tests)
+[![DeepAgents](https://img.shields.io/badge/DeepAgents-0.5-FF9966.svg)](https://github.com/langchain-ai/deepagents)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/yli769227-jpg/langchainAgent/pulls)
 
 基于 **LangChain 1.2 + LangGraph 1.1 + FastAPI** 的全栈智能 Agent。
@@ -20,6 +21,8 @@
 |----|------|------|
 | Agent 框架 | LangChain | `1.2.x` |
 | 状态机 | LangGraph | `1.1.x` |
+| Deep Agents | deepagents (planning + filesystem + subagent) | `0.5.x` |
+| 可观测 | LangSmith trace (可选,env 驱动) | `0.8+` |
 | LLM 接入 | langchain-openai / langchain-anthropic | `1.2.x` / `1.4.x` |
 | 后端 | FastAPI | `0.115+` |
 | 嵌入 | sentence-transformers (BGE-small-zh) | `3.x+` |
@@ -112,6 +115,8 @@ pytest tests/ -v
 - `test_calc_safety.py`：AST 白名单（拒 import / lambda / 属性访问 / 推导式 / 字符串 / 深嵌套）
 - `test_agent_dispatch.py`：用 `GenericFakeChatModel` mock LLM，
   端到端验证 `run_agent` → 工具调度 → step 返回值
+- `test_langsmith_config.py`：`_langsmith_config` 在 env 开/关下的行为
+- `test_deep_agent_smoke.py`：`_build_deep_agent` / `_summarize_deep_run` / `run_autonomous_chat` / `_call_sub_agent` 的冒烟,fake LLM 驱动
 
 **测试不依赖任何真 API**。
 
@@ -150,9 +155,45 @@ data: {"type":"done","steps":[...]}
 ```
 AGENT_LOGIN_PASSWORD=agent2024     # 前端登录密码（默认 agent2024）
 AGENT_INSECURE_SSL=0               # 1 = 关闭证书校验（自签证书中转用）
+
+# LangSmith trace (可选)
+LANGSMITH_TRACING=true             # 必须 true 且配 API key 才上报
+LANGSMITH_API_KEY=lsv2_pt_xxx      # https://smith.langchain.com → Settings → API Keys
+LANGSMITH_PROJECT=langchainAgent   # 项目名
 ```
 
 API Key / base_url 从前端请求体传入，**服务器不持久化任何凭证**。
+
+## Deep Agents 模式
+
+`/agent/{id}/chat` 的 `autonomous` 类型和 `multi_agent` 的每个子 agent 现在都由
+[deepagents](https://github.com/langchain-ai/deepagents) 的 `create_deep_agent` 驱动:
+
+- 主 agent 自带 `write_todos` 维护任务清单(替代旧版手写 PLAN_PROMPT/REFLECT_PROMPT)
+- 内置虚拟文件系统(`ls` / `read_file` / `write_file` / `edit_file` / `glob` / `grep`)用于中间结果暂存
+- `task` 工具支持子代理调度,在 multi_agent 模式里和你配置的 sub agents 解耦
+- `execute` 工具需要 SandboxBackendProtocol 才生效,默认 backend 下静默 no-op
+
+autonomous 返回结构新增 `autonomous_log[0]` 形如:
+
+```json
+{
+  "phase": "deep_agent_run",
+  "todos": [{"id": "1", "content": "step 1", "status": "completed"}],
+  "file_keys": ["plan.md"],
+  "tool_steps": [{"tool": "calculator", "input": {...}, "output": "..."}]
+}
+```
+
+## LangSmith trace
+
+配 `LANGSMITH_TRACING=true` + `LANGSMITH_API_KEY` 后,自动给所有 agent invoke 注入:
+
+- `run_name`: 端点级别名(`chat` / `chat_stream` / `deep_agent:<name>` / `sub_deep_agent:<name>`)
+- `tags`: `endpoint:xxx`、`model:xxx`、`mode:autonomous` 等,LangSmith UI 可一键过滤
+- `metadata.session_id`: 串起一个对话的所有 trace
+
+env 缺任一项时静默不上报,业务路径完全无副作用。
 
 ## 扩展工具
 

@@ -31,12 +31,65 @@ from langchain.agents import create_agent
 from langchain_core.tools import tool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_openai import ChatOpenAI
+from deepagents import create_deep_agent, SubAgent
+
+# 在任何 langchain/langsmith import 触发 env 读取前先加载 .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
 )
 logger = logging.getLogger("agent")
+
+
+def _langsmith_enabled() -> bool:
+    """LANGSMITH_TRACING=true 且配了 API key 才视作启用。缺任一即静默不上报。"""
+    flag = os.getenv("LANGSMITH_TRACING", "").lower() in ("1", "true", "yes")
+    has_key = bool(os.getenv("LANGSMITH_API_KEY"))
+    return flag and has_key
+
+
+def _langsmith_config(
+    run_name: str,
+    session_id: str | None = None,
+    tags: list[str] | None = None,
+    extra_metadata: dict | None = None,
+    recursion_limit: int = 25,
+) -> dict:
+    """构造 LangChain/LangGraph invoke 的 config。
+
+    缺 LANGSMITH_TRACING 或 LANGSMITH_API_KEY 时只返回最小 config(不带 trace 元数据),
+    保证未配 LangSmith 的环境下行为不变。
+    """
+    cfg: dict = {"recursion_limit": recursion_limit}
+    if not _langsmith_enabled():
+        return cfg
+    cfg["run_name"] = run_name
+    cfg["tags"] = list(tags or [])
+    metadata: dict = {}
+    if session_id:
+        metadata["session_id"] = session_id
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    if metadata:
+        cfg["metadata"] = metadata
+    return cfg
+
+
+# 启动时单次状态日志,便于排查 trace 是否真的启用
+if _langsmith_enabled():
+    logger.info(
+        "[langsmith] tracing enabled project=%s endpoint=%s",
+        os.getenv("LANGSMITH_PROJECT", "<default>"),
+        os.getenv("LANGSMITH_ENDPOINT", "<default>"),
+    )
+else:
+    logger.info("[langsmith] tracing disabled (set LANGSMITH_TRACING=true + LANGSMITH_API_KEY to enable)")
 
 
 def mask_key(k: str) -> str:
@@ -508,21 +561,33 @@ def _extract_steps_from_messages(messages: list) -> list:
     return steps
 
 
-def run_agent(api_key: str, base_url: str, model_name: str, messages: list) -> tuple[str, list]:
+def run_agent(
+    api_key: str,
+    base_url: str,
+    model_name: str,
+    messages: list,
+    *,
+    extra_config: dict | None = None,
+) -> tuple[str, list]:
     """用 LangChain create_agent + LangGraph 执行 ReAct 循环。
 
-    签名/返回不变（兼容原调用方）：
-        返回 (最终回复文本, [{"tool":..., "input":..., "output":...}])
+    返回 (最终回复文本, [{"tool":..., "input":..., "output":...}])。
+    extra_config 是可选的 LangChain invoke config(用于注入 LangSmith run_name/tags/metadata),
+    省略时行为与旧版完全一致。
     """
     logger.info("[run_agent] 启动 LangGraph agent model=%s base=%s msgs=%d",
                 model_name, base_url, len(messages))
     model = _build_chat_model(api_key, base_url, model_name)
     agent = create_agent(model=model, tools=TOOLS)
 
+    invoke_config: dict = {"recursion_limit": 25}
+    if extra_config:
+        invoke_config.update(extra_config)
+
     try:
         result = agent.invoke(
             {"messages": messages},
-            config={"recursion_limit": 25},
+            config=invoke_config,
         )
     except Exception as e:
         logger.exception("[run_agent] LangGraph invoke 异常: %s", e)
@@ -610,8 +675,15 @@ async def chat(req: ChatRequest):
             + [{"role": "user", "content": req.message}]
         )
 
+        trace_cfg = _langsmith_config(
+            run_name="chat",
+            session_id=req.session_id,
+            tags=["endpoint:chat", f"model:{req.model_name}"],
+            extra_metadata={"kb_id": req.kb_id} if req.kb_id else None,
+        )
         response_text, steps = await asyncio.to_thread(
-            run_agent, req.api_key, req.base_url, req.model_name, messages
+            run_agent, req.api_key, req.base_url, req.model_name, messages,
+            extra_config=trace_cfg,
         )
 
         # 更新历史，保留最近 20 条
@@ -656,11 +728,18 @@ async def chat_stream(req: ChatRequest):
         steps: list = []
         final_text_parts: list = []
 
+        stream_cfg = {"recursion_limit": 25}
+        stream_cfg.update(_langsmith_config(
+            run_name="chat_stream",
+            session_id=req.session_id,
+            tags=["endpoint:chat_stream", f"model:{req.model_name}"],
+            extra_metadata={"kb_id": req.kb_id} if req.kb_id else None,
+        ))
         try:
             async for event in agent.astream_events(
                 {"messages": messages},
                 version="v2",
-                config={"recursion_limit": 25},
+                config=stream_cfg,
             ):
                 kind = event.get("event")
                 data = event.get("data", {}) or {}
@@ -1061,11 +1140,34 @@ async def delete_agent(agent_id: str):
 # ── 多智能体协同执行引擎 ──
 
 def _call_sub_agent(sub_ag: dict, user_input: str, session_id: str, api_key: str, base_url: str) -> tuple[str, list]:
-    """调用单个子 agent，返回 (回复文本, 工具步骤)"""
+    """调用单个子 agent,返回 (回复文本, 工具步骤)。
+
+    每个子 agent 用 deepagents.create_deep_agent 构造,自带 write_todos / 文件系统 / task 等内置原语,
+    让子代理在 sequential/parallel/debate 流程内部也能自主规划而不是只跑 ReAct。
+    """
     system = sub_ag.get("system_prompt") or SYSTEM_PROMPT
     history = session_histories.get(session_id, [])
-    messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_input}]
-    return run_agent(api_key, base_url, sub_ag.get("model_name", "claude-sonnet-4-6"), messages)
+    # system_prompt 走 create_deep_agent(system_prompt=...) 注入,messages 不再 prepend system 避免重复。
+    messages = list(history) + [{"role": "user", "content": user_input}]
+    model_name = sub_ag.get("model_name", "claude-sonnet-4-6")
+
+    trace_cfg = _langsmith_config(
+        run_name=f"sub_deep_agent:{sub_ag.get('name','sub')}",
+        session_id=session_id,
+        tags=["mode:multi_agent_sub", f"sub:{sub_ag.get('name','')}", f"model:{model_name}"],
+        extra_metadata={"sub_agent_id": sub_ag.get("id", "")},
+    )
+
+    logger.info("[multi_agent_sub] 启动 deep sub-agent name=%s model=%s", sub_ag.get("name"), model_name)
+    try:
+        agent = _build_deep_agent(api_key, base_url, model_name, list(TOOLS), system)
+        result = agent.invoke({"messages": messages}, config=trace_cfg)
+    except Exception as e:
+        logger.exception("[multi_agent_sub] deep agent invoke 异常 name=%s: %s", sub_ag.get("name"), e)
+        return f"子代理执行失败: {type(e).__name__}: {e}", []
+
+    summary = _summarize_deep_run(result)
+    return summary["final"], summary["tool_steps"]
 
 
 async def run_multi_agent_chat(ag: dict, user_input: str, session_id: str, api_key: str, base_url: str) -> dict:
@@ -1138,155 +1240,102 @@ async def run_multi_agent_chat(ag: dict, user_input: str, session_id: str, api_k
     return {"response": final, "steps": [], "multi_agent_log": log, "session_id": session_id}
 
 
-# ── 自主规划执行引擎 ──
+# ── 自主规划执行引擎 (基于 deepagents.create_deep_agent) ──
 
-PLAN_PROMPT = """你是一个任务规划专家。请将用户的任务拆解为具体的执行步骤。
-你必须以 JSON 格式输出，格式如下：
-{"steps": [{"step": 1, "description": "步骤描述", "tool": "工具名称或null"}]}
 
-可用工具: {tools}
+def _build_deep_agent(api_key: str, base_url: str, model_name: str, tools: list, system_prompt: str):
+    """构造 deep agent。
 
-注意：
-- 每个步骤应该是一个具体的、可执行的操作
-- tool 字段如果不需要工具则填 null
-- 步骤数量不要超过 {max_steps} 步
-- 只输出 JSON，不要输出其他内容"""
+    deep agent 自带 write_todos / 文件系统 / task / execute 等内置工具,实现"规划 + 子代理"原语,
+    替代旧版手写的 PLAN/REFLECT/replan 循环。
+    """
+    model = _build_chat_model(api_key, base_url, model_name)
+    return create_deep_agent(
+        model=model,
+        tools=tools,
+        system_prompt=system_prompt,
+    )
 
-REFLECT_PROMPT = """你是一个任务执行评估专家。请评估当前步骤的执行结果，判断是否需要调整后续计划。
 
-原始任务: {task}
-当前计划: {plan}
-已完成步骤: {completed}
-当前步骤结果: {current_result}
-
-请以 JSON 格式回答：
-{{"assessment": "对当前结果的评估", "need_replan": true/false, "reason": "原因"}}
-
-只输出 JSON。"""
+def _summarize_deep_run(result: dict) -> dict:
+    """从 deep agent invoke 结果里抽取 todos / files / final_text 摘要,供前端日志展示。"""
+    msgs = result.get("messages", []) if isinstance(result, dict) else []
+    final = ""
+    if msgs:
+        final = getattr(msgs[-1], "content", "") or ""
+    files = result.get("files", {}) if isinstance(result, dict) else {}
+    todos = result.get("todos", []) if isinstance(result, dict) else []
+    return {
+        "final": final,
+        "todos": todos,
+        "file_keys": list(files.keys()) if isinstance(files, dict) else [],
+        "tool_steps": _extract_steps_from_messages(msgs),
+    }
 
 
 async def run_autonomous_chat(ag: dict, user_input: str, session_id: str, api_key: str, base_url: str) -> dict:
+    """autonomous 模式: 用 deepagents.create_deep_agent 替代旧版手写 PLAN/REFLECT/replan 循环。
+
+    保留语义:
+    - available_tools 白名单仍然生效(过滤用户 TOOLS,不影响 deep agent 内置工具)
+    - max_steps 转换为 recursion_limit(deep agent 一个用户步骤可能涉及多次 tool call)
+    - 返回字段保持 {response, steps, autonomous_log, session_id} 形态
+    """
     available = ag.get("available_tools", [])
     max_steps = ag.get("max_steps", 10)
-    tool_names = ", ".join(available) if available else "无"
-    execution_log = []
-
-    # 1. 规划阶段
-    plan_system = PLAN_PROMPT.format(tools=tool_names, max_steps=max_steps)
-    plan_msgs = [{"role": "system", "content": plan_system}, {"role": "user", "content": user_input}]
-    plan_text, _ = await asyncio.to_thread(run_agent, api_key, base_url, ag["model_name"], plan_msgs)
-
-    try:
-        # 提取 JSON（兼容 markdown code block）
-        clean = plan_text.strip()
-        if "```" in clean:
-            clean = clean.split("```")[1]
-            if clean.startswith("json"):
-                clean = clean[4:]
-            clean = clean.strip()
-        plan = json.loads(clean)
-    except Exception:
-        plan = {"steps": [{"step": 1, "description": user_input, "tool": None}]}
-
-    execution_log.append({"phase": "plan", "content": plan})
-    steps_plan = plan.get("steps", [])
-    completed_results = []
-
-    # 2. 执行 + 反思循环
-    step_count = 0
-    i = 0
-    while i < len(steps_plan) and step_count < max_steps:
-        step_info = steps_plan[i]
-        step_desc = step_info.get("description", "")
-        step_tool = step_info.get("tool")
-
-        # 构建执行 prompt
-        context = "\n".join(f"步骤{j+1}结果: {r}" for j, r in enumerate(completed_results))
-        exec_prompt = f"请执行以下任务步骤:\n{step_desc}"
-        if context:
-            exec_prompt = f"之前步骤的结果:\n{context}\n\n{exec_prompt}"
-
-        system = ag.get("system_prompt") or SYSTEM_PROMPT
-        # 工具白名单：步骤可用工具子集（available 为空则放开全部）
-        allowed_tools = [t for t in TOOLS if t.name in available] if available else TOOLS
-        exec_msgs = [{"role": "system", "content": system}, {"role": "user", "content": exec_prompt}]
-
-        # 执行：直接复用 LangGraph create_agent，避免再造轮子
-        def _run_step():
-            model = _build_chat_model(api_key, base_url, ag["model_name"])
-            sub_agent = create_agent(model=model, tools=allowed_tools)
-            return sub_agent.invoke({"messages": exec_msgs}, config={"recursion_limit": 10})
-
-        try:
-            sub_result = await asyncio.to_thread(_run_step)
-            sub_msgs = sub_result.get("messages", [])
-            step_result = getattr(sub_msgs[-1], "content", "") if sub_msgs else ""
-            exec_steps = _extract_steps_from_messages(sub_msgs)
-        except Exception as e:
-            logger.exception("[autonomous] 步骤执行异常: %s", e)
-            step_result = f"步骤执行失败: {type(e).__name__}: {e}"
-            exec_steps = []
-
-        completed_results.append(step_result)
-        execution_log.append({
-            "phase": "execute", "step": step_info.get("step", i+1),
-            "description": step_desc, "result": step_result, "tool_steps": exec_steps
-        })
-
-        # 3. 反思阶段
-        reflect_system = REFLECT_PROMPT.format(
-            task=user_input, plan=json.dumps(steps_plan, ensure_ascii=False),
-            completed=json.dumps(completed_results, ensure_ascii=False), current_result=step_result
-        )
-        reflect_msgs = [{"role": "system", "content": reflect_system}, {"role": "user", "content": "请评估"}]
-        reflect_text, _ = await asyncio.to_thread(run_agent, api_key, base_url, ag["model_name"], reflect_msgs)
-
-        try:
-            rclean = reflect_text.strip()
-            if "```" in rclean:
-                rclean = rclean.split("```")[1]
-                if rclean.startswith("json"):
-                    rclean = rclean[4:]
-                rclean = rclean.strip()
-            reflection = json.loads(rclean)
-        except Exception:
-            reflection = {"assessment": reflect_text, "need_replan": False, "reason": ""}
-
-        execution_log.append({"phase": "reflect", "step": step_info.get("step", i+1), "content": reflection})
-
-        # 4. 重规划
-        if reflection.get("need_replan"):
-            replan_prompt = f"原始任务: {user_input}\n已完成步骤结果: {json.dumps(completed_results, ensure_ascii=False)}\n反思: {reflection.get('reason', '')}\n\n请重新规划剩余步骤。"
-            replan_msgs = [{"role": "system", "content": plan_system}, {"role": "user", "content": replan_prompt}]
-            replan_text, _ = await asyncio.to_thread(run_agent, api_key, base_url, ag["model_name"], replan_msgs)
-            try:
-                rp_clean = replan_text.strip()
-                if "```" in rp_clean:
-                    rp_clean = rp_clean.split("```")[1]
-                    if rp_clean.startswith("json"):
-                        rp_clean = rp_clean[4:]
-                    rp_clean = rp_clean.strip()
-                new_plan = json.loads(rp_clean)
-                steps_plan = new_plan.get("steps", [])
-                i = 0
-                execution_log.append({"phase": "replan", "content": new_plan})
-            except Exception:
-                i += 1
-        else:
-            i += 1
-        step_count += 1
-
-    # 最终汇总
-    summary_prompt = f"原始任务: {user_input}\n\n执行结果:\n" + "\n".join(f"步骤{j+1}: {r}" for j, r in enumerate(completed_results)) + "\n\n请给出最终的综合回答。"
+    allowed_tools = [t for t in TOOLS if t.name in available] if available else list(TOOLS)
     system = ag.get("system_prompt") or SYSTEM_PROMPT
-    summary_msgs = [{"role": "system", "content": system}, {"role": "user", "content": summary_prompt}]
-    final, _ = await asyncio.to_thread(run_agent, api_key, base_url, ag["model_name"], summary_msgs)
 
     history = session_histories.get(session_id, [])
+    # 注意: system_prompt 已经通过 _build_deep_agent → create_deep_agent(system_prompt=...) 注入,
+    # messages 里不要再 prepend system,否则会和 SDK 默认 prompt 一起重复传给模型。
+    messages = list(history) + [{"role": "user", "content": user_input}]
+
+    trace_cfg = _langsmith_config(
+        run_name=f"deep_agent:{ag.get('name','autonomous')}",
+        session_id=session_id,
+        tags=["endpoint:agent_chat", "mode:autonomous", f"model:{ag.get('model_name','')}"],
+        extra_metadata={"agent_id": ag.get("id", ""), "max_steps": max_steps},
+        recursion_limit=max(25, max_steps * 6),
+    )
+
+    logger.info("[autonomous] 启动 deep agent agent_id=%s max_steps=%d tools=%d",
+                ag.get("id"), max_steps, len(allowed_tools))
+
+    def _run():
+        agent = _build_deep_agent(api_key, base_url, ag["model_name"], allowed_tools, system)
+        return agent.invoke({"messages": messages}, config=trace_cfg)
+
+    try:
+        result = await asyncio.to_thread(_run)
+    except Exception as e:
+        logger.exception("[autonomous] deep agent invoke 异常: %s", e)
+        err = f"自主执行失败: {type(e).__name__}: {e}"
+        history.append({"role": "user", "content": user_input})
+        history.append({"role": "assistant", "content": err})
+        session_histories[session_id] = history[-20:]
+        return {"response": err, "steps": [], "autonomous_log": [{"phase": "error", "detail": str(e)}], "session_id": session_id}
+
+    summary = _summarize_deep_run(result)
+    final = summary["final"]
+    logger.info("[autonomous] 完成 final_len=%d steps=%d todos=%d files=%d",
+                len(final), len(summary["tool_steps"]), len(summary["todos"]), len(summary["file_keys"]))
+
     history.append({"role": "user", "content": user_input})
     history.append({"role": "assistant", "content": final})
     session_histories[session_id] = history[-20:]
-    return {"response": final, "steps": [], "autonomous_log": execution_log, "session_id": session_id}
+
+    return {
+        "response": final,
+        "steps": summary["tool_steps"],
+        "autonomous_log": [{
+            "phase": "deep_agent_run",
+            "todos": summary["todos"],
+            "file_keys": summary["file_keys"],
+            "tool_steps": summary["tool_steps"],
+        }],
+        "session_id": session_id,
+    }
 
 
 @app.post("/agent/{agent_id}/chat")
