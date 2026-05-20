@@ -2,16 +2,14 @@
 LangChain Agent Backend - FastAPI
 
 真接入 LangChain 1.2 + LangGraph 1.1 栈：
-- 工具用 @tool 装饰，schema 自动派生
+- 工具用 @tool 装饰，schema 自动派生(在 tools/ 子包里逐个文件维护)
 - run_agent 走 langchain.agents.create_agent (LangGraph 状态机)
 - /chat/stream 用 agent.astream_events 流式
 - 兼容第三方/中转 OpenAI 格式接口（任意 base_url）
+- 可观测: LangSmith trace + Langfuse callback,二者独立,各自由 env 驱动
 """
 
 import os
-import ast
-import math
-import operator
 import datetime
 import json
 import logging
@@ -22,13 +20,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import asyncio
-import urllib.request
-import urllib.parse
-import ssl
 
 # LangChain / LangGraph 栈
 from langchain.agents import create_agent
-from langchain_core.tools import tool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_openai import ChatOpenAI
 from deepagents import create_deep_agent, SubAgent
@@ -39,6 +33,31 @@ try:
     load_dotenv()
 except Exception:
     pass
+
+# 工具拆出到 tools/ 子包,共享运行时状态(知识库 / BGE / SSL) 放 runtime.py
+# main.py 顶部 re-export 这些名字,保持原 main.* 访问路径兼容 tests/ 和外部调用方。
+from runtime import (
+    _bge_model,  # 兼容 import: 测试和旧调用方可能引用
+    _cosine,
+    _encode,
+    _get_bge_model,
+    _keyword_score,
+    _ssl_ctx,
+    knowledge_bases,
+)
+from tools import (
+    ALL_TOOLS,
+    calculator,
+    fetch_url,
+    get_current_time,
+    get_weather,
+    search_knowledge_base,
+    text_analyzer,
+    unit_converter,
+    web_search,
+    word_counter,
+)
+from tools.calculator import _calc_eval  # tests/test_calc_safety.py 用 main._calc_eval
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,17 +86,19 @@ def _langsmith_config(
     保证未配 LangSmith 的环境下行为不变。
     """
     cfg: dict = {"recursion_limit": recursion_limit}
-    if not _langsmith_enabled():
-        return cfg
-    cfg["run_name"] = run_name
-    cfg["tags"] = list(tags or [])
-    metadata: dict = {}
-    if session_id:
-        metadata["session_id"] = session_id
-    if extra_metadata:
-        metadata.update(extra_metadata)
-    if metadata:
-        cfg["metadata"] = metadata
+    if _langsmith_enabled():
+        cfg["run_name"] = run_name
+        cfg["tags"] = list(tags or [])
+        metadata: dict = {}
+        if session_id:
+            metadata["session_id"] = session_id
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        if metadata:
+            cfg["metadata"] = metadata
+    # Langfuse 独立通道:env 就绪就把 CallbackHandler 加到 callbacks,
+    # 即使 LangSmith 没开也能单独用 Langfuse 看 trace。
+    _inject_langfuse_callback(cfg)
     return cfg
 
 
@@ -92,6 +113,65 @@ else:
     logger.info("[langsmith] tracing disabled (set LANGSMITH_TRACING=true + LANGSMITH_API_KEY to enable)")
 
 
+# ==================== Langfuse 可选 callback ====================
+# Langfuse 与 LangSmith 独立:LangSmith 走 langchain 内置 tracer(env LANGSMITH_*),
+# Langfuse 走 langchain CallbackHandler,我们注入到 invoke config["callbacks"]。
+# 任一缺 PUBLIC_KEY/SECRET_KEY 就跳过,不报错。装好 langfuse 包但没配 key 也跳过。
+
+
+def _langfuse_enabled() -> bool:
+    """同时配了 LANGFUSE_PUBLIC_KEY 和 LANGFUSE_SECRET_KEY 才视作启用。"""
+    return bool(os.getenv("LANGFUSE_PUBLIC_KEY")) and bool(os.getenv("LANGFUSE_SECRET_KEY"))
+
+
+_langfuse_handler = None
+_langfuse_init_failed = False
+
+
+def _get_langfuse_handler():
+    """懒加载 Langfuse CallbackHandler。env 缺 key / langfuse 未装 / 初始化失败 → 返回 None。"""
+    global _langfuse_handler, _langfuse_init_failed
+    if _langfuse_handler is not None or _langfuse_init_failed:
+        return _langfuse_handler
+    if not _langfuse_enabled():
+        return None
+    try:
+        # langfuse>=4 提供 langfuse.langchain.CallbackHandler,内部读 LANGFUSE_* env 自建 client
+        from langfuse.langchain import CallbackHandler
+        _langfuse_handler = CallbackHandler()
+        logger.info(
+            "[langfuse] callback enabled host=%s",
+            os.getenv("LANGFUSE_HOST", "<default https://cloud.langfuse.com>"),
+        )
+    except Exception as e:
+        _langfuse_init_failed = True
+        logger.warning("[langfuse] handler init failed, tracing disabled: %s", e)
+    return _langfuse_handler
+
+
+def _inject_langfuse_callback(cfg: dict) -> dict:
+    """如果 Langfuse 启用,把 handler 追加到 config['callbacks']。无 side-effect 友好,可重复调用。"""
+    handler = _get_langfuse_handler()
+    if handler is None:
+        return cfg
+    callbacks = list(cfg.get("callbacks") or [])
+    if handler not in callbacks:
+        callbacks.append(handler)
+    cfg["callbacks"] = callbacks
+    return cfg
+
+
+# 启动时单次状态日志
+if _langfuse_enabled():
+    # 真正实例化推迟到第一次 invoke,这里只通报 env 已就绪
+    logger.info(
+        "[langfuse] env keys present, host=%s (handler lazy-init on first invoke)",
+        os.getenv("LANGFUSE_HOST", "<default cloud>"),
+    )
+else:
+    logger.info("[langfuse] env keys missing, skip (set LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY to enable)")
+
+
 def mask_key(k: str) -> str:
     """掩码 API Key，只保留前 6 后 4 便于排查又不泄漏。"""
     if not k:
@@ -101,12 +181,7 @@ def mask_key(k: str) -> str:
     return f"{k[:6]}...{k[-4:]}"
 
 
-# 第三方中转服务可能用自签证书，默认仍校验；如需关闭由环境变量开启
-_ssl_ctx = ssl.create_default_context()
-if os.getenv("AGENT_INSECURE_SSL") == "1":
-    _ssl_ctx.check_hostname = False
-    _ssl_ctx.verify_mode = ssl.CERT_NONE
-    logger.warning("SSL 证书验证已关闭 (AGENT_INSECURE_SSL=1)")
+# _ssl_ctx 已在 runtime.py 统一构造,这里只 re-export(顶部 import 已 alias)
 
 app = FastAPI(title="LangChain Agent API", version="2.0.0")
 
@@ -120,386 +195,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================== Tools 实现 ====================
-
-# AST 白名单计算器：不走 eval，只放行算术 + 指定函数/常量
-_CALC_OPS = {
-    ast.Add: operator.add, ast.Sub: operator.sub,
-    ast.Mult: operator.mul, ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
-    ast.USub: operator.neg, ast.UAdd: operator.pos,
-}
-_CALC_NAMES = {
-    n: getattr(math, n) for n in (
-        "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-        "sinh", "cosh", "tanh", "sqrt", "log", "log2", "log10",
-        "exp", "ceil", "floor", "factorial", "gcd",
-        "degrees", "radians", "pi", "e", "tau", "inf",
-    )
-}
-_CALC_NAMES.update({"abs": abs, "round": round, "min": min, "max": max, "pow": pow})
+# ==================== Tools 已移到 tools/ 子包 ====================
+# 9 个 @tool 函数(calculator/get_current_time/text_analyzer/unit_converter/
+# word_counter/get_weather/search_knowledge_base/fetch_url/web_search)拆分到
+# tools/ 目录,每个文件一个工具,统一从 `from tools import ALL_TOOLS` 引入。
+# 共享运行时状态(知识库 / BGE 模型 / SSL ctx)在 runtime.py。
+# main.py 顶部已 re-export 所有名字,测试和外部调用方仍可通过 main.<tool_name> 访问。
 
 
-def _calc_eval(node, depth: int = 0):
-    if depth > 50:
-        raise ValueError("表达式嵌套过深")
-    if isinstance(node, ast.Expression):
-        return _calc_eval(node.body, depth + 1)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.Name):
-        if node.id in _CALC_NAMES:
-            return _CALC_NAMES[node.id]
-        raise ValueError(f"未知标识符: {node.id}")
-    if isinstance(node, ast.BinOp):
-        op = _CALC_OPS.get(type(node.op))
-        if op is None:
-            raise ValueError(f"不允许的运算符: {type(node.op).__name__}")
-        return op(_calc_eval(node.left, depth + 1), _calc_eval(node.right, depth + 1))
-    if isinstance(node, ast.UnaryOp):
-        op = _CALC_OPS.get(type(node.op))
-        if op is None:
-            raise ValueError("不允许的一元运算符")
-        return op(_calc_eval(node.operand, depth + 1))
-    if isinstance(node, ast.Call):
-        fn = _calc_eval(node.func, depth + 1)
-        if not callable(fn):
-            raise ValueError("非可调用对象")
-        args = [_calc_eval(a, depth + 1) for a in node.args]
-        return fn(*args)
-    raise ValueError(f"不允许的语法: {type(node).__name__}")
-
-
-@tool
-def calculator(expression: str) -> str:
-    """执行数学计算。支持基本四则运算、幂运算、三角函数、对数等。示例: '2 + 3 * 4', 'sqrt(16)'。
-
-    Args:
-        expression: 数学表达式字符串
-    """
-    if len(expression) > 500:
-        return "计算错误: 表达式过长（上限 500 字符）"
-    try:
-        tree = ast.parse(expression, mode="eval")
-        result = _calc_eval(tree)
-        return f"计算结果: {expression} = {result}"
-    except Exception as e:
-        return f"计算错误: {str(e)}"
-
-
-@tool
-def get_current_time(timezone: str = "Asia/Shanghai") -> str:
-    """获取当前日期和时间（北京时间）。
-
-    Args:
-        timezone: 时区，默认 Asia/Shanghai
-    """
-    now = datetime.datetime.now()
-    return (
-        f"当前时间（北京时间）: {now.strftime('%Y年%m月%d日 %H:%M:%S')}\n"
-        f"星期: {['周一','周二','周三','周四','周五','周六','周日'][now.weekday()]}\n"
-        f"今年第 {now.timetuple().tm_yday} 天"
-    )
-
-
-@tool
-def text_analyzer(text: str) -> str:
-    """分析文本统计信息：字符数、词数、行数、中文字符数等。
-
-    Args:
-        text: 要分析的文本
-    """
-    lines = text.split('\n')
-    words = text.split()
-    chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-    return (
-        f"📊 文本分析结果:\n"
-        f"  - 总字符数: {len(text)}\n"
-        f"  - 中文字符数: {chinese_chars}\n"
-        f"  - 英文单词数: {len(words)}\n"
-        f"  - 行数: {len(lines)}\n"
-        f"  - 段落数: {len([l for l in lines if l.strip()])}"
-    )
-
-
-@tool
-def unit_converter(value: float, from_unit: str, to_unit: str) -> str:
-    """单位换算。支持长度(m,km,mile,ft,cm,mm)、重量(kg,lb,g,oz)、温度(celsius,fahrenheit,kelvin)。
-
-    Args:
-        value: 要换算的数值
-        from_unit: 原单位
-        to_unit: 目标单位
-    """
-    conversions = {
-        ("m", "km"): 0.001,         ("km", "m"): 1000,
-        ("m", "mile"): 0.000621371, ("mile", "m"): 1609.34,
-        ("m", "ft"): 3.28084,       ("ft", "m"): 0.3048,
-        ("m", "cm"): 100,           ("cm", "m"): 0.01,
-        ("m", "mm"): 1000,          ("mm", "m"): 0.001,
-        ("km", "mile"): 0.621371,   ("mile", "km"): 1.60934,
-        ("cm", "mm"): 10,           ("mm", "cm"): 0.1,
-        ("kg", "lb"): 2.20462,      ("lb", "kg"): 0.453592,
-        ("kg", "g"): 1000,          ("g", "kg"): 0.001,
-        ("kg", "oz"): 35.274,       ("oz", "kg"): 0.0283495,
-        ("g", "oz"): 0.035274,      ("oz", "g"): 28.3495,
-    }
-    key = (from_unit.lower(), to_unit.lower())
-    f, t = from_unit.lower(), to_unit.lower()
-    if f == "celsius" and t == "fahrenheit":
-        result = value * 9/5 + 32
-    elif f == "fahrenheit" and t == "celsius":
-        result = (value - 32) * 5/9
-    elif f == "celsius" and t == "kelvin":
-        result = value + 273.15
-    elif f == "kelvin" and t == "celsius":
-        result = value - 273.15
-    elif key in conversions:
-        result = value * conversions[key]
-    else:
-        return f"不支持 {from_unit} 到 {to_unit} 的换算"
-    return f"{value} {from_unit} = {result:.4f} {to_unit}"
-
-
-@tool
-def word_counter(text: str, target_word: str) -> str:
-    """在文本中统计特定词语出现的次数（不区分大小写）。
-
-    Args:
-        text: 要搜索的文本
-        target_word: 要统计的词语
-    """
-    count = text.lower().count(target_word.lower())
-    return f"词语 '{target_word}' 在文本中出现了 {count} 次"
-
-
-@tool
-def get_weather(city: str) -> str:
-    """查询指定城市的实时天气，包括温度、湿度、风速、天气状况等。
-
-    Args:
-        city: 城市名称，支持中文或英文，如 '北京'、'Shanghai'、'London'
-    """
-    try:
-        # 第一步：用 open-meteo geocoding API 将城市名转为经纬度
-        encoded_city = urllib.parse.quote(city)
-        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={encoded_city}&count=1&language=zh&format=json"
-        req = urllib.request.Request(geo_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10, context=_ssl_ctx) as resp:
-            geo_data = json.loads(resp.read().decode())
-
-        if not geo_data.get("results"):
-            return f"找不到城市: {city}"
-
-        result = geo_data["results"][0]
-        lat = result["latitude"]
-        lon = result["longitude"]
-        city_name = result.get("name", city)
-        country = result.get("country", "")
-
-        # 第二步：用经纬度查询实时天气
-        weather_url = (
-            f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={lat}&longitude={lon}"
-            f"&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
-            f"weather_code,wind_speed_10m,wind_direction_10m,visibility"
-            f"&wind_speed_unit=kmh&timezone=auto"
-        )
-        req2 = urllib.request.Request(weather_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req2, timeout=10, context=_ssl_ctx) as resp2:
-            w_data = json.loads(resp2.read().decode())
-
-        cur = w_data["current"]
-        temp = cur["temperature_2m"]
-        feels_like = cur["apparent_temperature"]
-        humidity = cur["relative_humidity_2m"]
-        wind_speed = cur["wind_speed_10m"]
-        wind_dir = cur["wind_direction_10m"]
-        visibility = cur.get("visibility", "N/A")
-        wmo_code = cur["weather_code"]
-
-        # WMO 天气代码简单映射
-        wmo_desc = {
-            0: "晴天", 1: "基本晴朗", 2: "局部多云", 3: "阴天",
-            45: "雾", 48: "冻雾",
-            51: "小毛毛雨", 53: "中毛毛雨", 55: "大毛毛雨",
-            61: "小雨", 63: "中雨", 65: "大雨",
-            71: "小雪", 73: "中雪", 75: "大雪",
-            80: "小阵雨", 81: "中阵雨", 82: "强阵雨",
-            95: "雷暴", 96: "雷暴伴小冰雹", 99: "雷暴伴大冰雹",
-        }
-        desc = wmo_desc.get(wmo_code, f"天气代码 {wmo_code}")
-
-        vis_str = f"{int(visibility/1000)} km" if isinstance(visibility, (int, float)) else str(visibility)
-
-        return (
-            f"🌤 {city_name}, {country} 实时天气\n"
-            f"  天气状况: {desc}\n"
-            f"  温度: {temp}°C（体感 {feels_like}°C）\n"
-            f"  湿度: {humidity}%\n"
-            f"  风速: {wind_speed} km/h，风向: {wind_dir}°\n"
-            f"  能见度: {vis_str}"
-        )
-    except Exception as e:
-        return f"天气查询失败: {str(e)}"
-
-
-# ==================== 知识库 ====================
-
+# uuid 用于 /knowledge-base /workflow /agent endpoint 生成 ID
 import uuid
 
-# 内存存储：{kb_id: {"name": str, "description": str, "docs": [str], "vectors": list}}
-knowledge_bases: dict[str, dict] = {}
-
-# BGE 模型懒加载
-_bge_model = None
-
-def _get_bge_model():
-    global _bge_model
-    if _bge_model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            _bge_model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
-        except Exception:
-            _bge_model = False  # 标记加载失败，降级为纯关键词
-    return _bge_model if _bge_model is not False else None
-
-
-def _keyword_score(doc: str, query: str) -> float:
-    query_words = set(query.lower().split())
-    doc_lower = doc.lower()
-    score = sum(1 for w in query_words if w in doc_lower)
-    score += sum(1 for c in query if c.strip() and c in doc)
-    return float(score)
-
-
-def _encode(texts: list) -> list:
-    model = _get_bge_model()
-    if model is None:
-        return []
-    # BGE 建议查询加前缀
-    return model.encode(texts, normalize_embeddings=True).tolist()
-
-
-def _cosine(a: list, b: list) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    return dot  # 已 normalize，dot == cosine
-
-
-@tool
-def search_knowledge_base(kb_id: str, query: str, top_k: int = 3) -> str:
-    """在指定知识库中搜索相关内容，用于回答基于知识库的问题。
-
-    Args:
-        kb_id: 知识库 ID
-        query: 搜索查询内容
-        top_k: 返回最相关的文档数量，默认 3
-    """
-    if kb_id not in knowledge_bases:
-        return f"知识库 {kb_id} 不存在"
-    kb = knowledge_bases[kb_id]
-    docs = kb["docs"]
-    if not docs:
-        return "知识库为空"
-
-    vectors = kb.get("vectors", [])
-    model = _get_bge_model()
-
-    scored = []
-    if model and len(vectors) == len(docs):
-        # 向量检索
-        query_vec = _encode(["为这个句子生成表示以用于检索相关文章：" + query])[0]
-        for i, doc in enumerate(docs):
-            vec_score = _cosine(query_vec, vectors[i])
-            kw_score = _keyword_score(doc, query)
-            # 归一化关键词分数后融合，向量权重 0.7，关键词权重 0.3
-            max_kw = max((_keyword_score(d, query) for d in docs), default=1) or 1
-            combined = 0.7 * vec_score + 0.3 * (kw_score / max_kw)
-            scored.append((combined, doc))
-    else:
-        # 降级：纯关键词
-        for doc in docs:
-            scored.append((_keyword_score(doc, query), doc))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    results = [doc for score, doc in scored[:top_k] if score > 0]
-    if not results:
-        return "未找到相关内容"
-    return "\n\n---\n\n".join(results)
-
-
-@tool
-def fetch_url(url: str, max_chars: int = 2000) -> str:
-    """抓取任意 HTTP(S) URL 的正文内容。HTML 会自动剥标签并压缩空白；JSON/纯文本原样返回。超过 max_chars 会截断。用于读文章/API/在线文档。
-
-    Args:
-        url: 目标 URL，必须以 http:// 或 https:// 开头
-        max_chars: 返回正文最大字符数，默认 2000，上限 8000
-    """
-    if not re.match(r"^https?://", url):
-        return "url 必须以 http:// 或 https:// 开头"
-    if max_chars > 8000:
-        max_chars = 8000
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (AgentFlow)"})
-        with urllib.request.urlopen(req, timeout=15, context=_ssl_ctx) as resp:
-            ctype = resp.headers.get("Content-Type", "")
-            raw = resp.read(1024 * 1024)  # 最多 1MB
-            body = raw.decode(resp.headers.get_content_charset() or "utf-8", errors="replace")
-        # 简易 HTML→文本：去 script/style 再剥标签
-        if "html" in ctype.lower() or body.lstrip().startswith("<"):
-            body = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", body, flags=re.DOTALL | re.IGNORECASE)
-            body = re.sub(r"<[^>]+>", " ", body)
-            body = re.sub(r"\s+", " ", body).strip()
-        truncated = len(body) > max_chars
-        body = body[:max_chars]
-        return f"URL: {url}\nContent-Type: {ctype}\n\n{body}" + ("\n\n[... 已截断]" if truncated else "")
-    except Exception as e:
-        return f"抓取失败: {type(e).__name__}: {str(e)}"
-
-
-@tool
-def web_search(query: str) -> str:
-    """用 DuckDuckGo 搜索网络信息，返回摘要和相关主题。适合快速查概念/时事/知识问答，无需 API Key。若需完整正文请用 fetch_url。
-
-    Args:
-        query: 搜索关键词或自然语言问题
-    """
-    try:
-        params = urllib.parse.urlencode({"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
-        req = urllib.request.Request(f"https://api.duckduckgo.com/?{params}", headers={"User-Agent": "Mozilla/5.0 (AgentFlow)"})
-        with urllib.request.urlopen(req, timeout=10, context=_ssl_ctx) as resp:
-            data = json.loads(resp.read().decode())
-        parts = []
-        if data.get("AbstractText"):
-            parts.append(f"摘要: {data['AbstractText']}")
-        if data.get("AbstractURL"):
-            parts.append(f"来源: {data['AbstractURL']}")
-        related = [r.get("Text", "") for r in data.get("RelatedTopics", []) if isinstance(r, dict) and r.get("Text")]
-        if related:
-            parts.append("相关结果:\n" + "\n".join(f"- {r}" for r in related[:5]))
-        if not parts:
-            return f"没有直接答案。建议用 fetch_url 抓取具体网页。查询: {query}"
-        return "\n\n".join(parts)
-    except Exception as e:
-        return f"搜索失败: {type(e).__name__}: {str(e)}"
-
-
-# ==================== LangChain 工具注册 ====================
-
-# 所有 @tool 装饰的工具集中注册
-TOOLS = [
-    calculator,
-    get_current_time,
-    text_analyzer,
-    unit_converter,
-    word_counter,
-    get_weather,
-    search_knowledge_base,
-    fetch_url,
-    web_search,
-]
+# TOOLS 直接复用 tools/__init__.py 的 ALL_TOOLS,保留 main.TOOLS 这个旧名字
+# 兼容 tests 和 /chat /chat/stream /run_workflow 等所有引用方
+TOOLS = ALL_TOOLS
 
 
 def _tools_to_openai_schema(tools: list) -> list:
