@@ -1,5 +1,10 @@
 # LangChain Agent
 
+> ⚠️ **本仓库已归档(Archived),仅供学习参考,不再维护。**
+> 代码为演示性质,**存在已知安全问题**:`fetch_url` 工具有 SSRF 风险、业务接口无鉴权、默认密码硬编码。**请勿将其部署到公网或生产环境。** 仅建议在本地隔离环境中阅读与试跑。
+>
+> **This repository is archived and unmaintained — for reference only.** The code is a demo and has known security issues (SSRF in `fetch_url`, no auth on endpoints, hard-coded default password). **Do not deploy it to the public internet or any production environment.**
+
 [![GitHub stars](https://img.shields.io/github/stars/yli769227-jpg/langchainAgent?style=social)](https://github.com/yli769227-jpg/langchainAgent/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/yli769227-jpg/langchainAgent?style=social)](https://github.com/yli769227-jpg/langchainAgent/network/members)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -9,7 +14,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![DeepAgents](https://img.shields.io/badge/DeepAgents-0.5-FF9966.svg)](https://github.com/langchain-ai/deepagents)
 [![Tests](https://img.shields.io/badge/tests-53_passed-brightgreen.svg)](./files/tests)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/yli769227-jpg/langchainAgent/pulls)
+[![Status](https://img.shields.io/badge/status-archived-lightgrey.svg)](#)
 
 基于 **LangChain 1.2 + LangGraph 1.1 + FastAPI** 的全栈智能 Agent。
 **真接入** LangChain 状态机栈,工具用 `@tool` 装饰,schema 自动派生,
