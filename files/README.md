@@ -23,6 +23,7 @@
 | 状态机 | LangGraph | `1.1.x` |
 | Deep Agents | deepagents (planning + filesystem + subagent) | `0.5.x` |
 | 可观测 | LangSmith trace (可选,env 驱动) | `0.8+` |
+| 可观测 | Langfuse callback (可选 tracing,env 驱动) | `4.x` |
 | LLM 接入 | langchain-openai / langchain-anthropic | `1.2.x` / `1.4.x` |
 | 后端 | FastAPI | `0.115+` |
 | 嵌入 | sentence-transformers (BGE-small-zh) | `3.x+` |

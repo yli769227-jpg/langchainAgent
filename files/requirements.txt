@@ -7,6 +7,7 @@ langchain-anthropic>=1.4.3,<2
 langchain-core>=1.3.2,<2
 deepagents>=0.5.9,<0.6
 langsmith>=0.8.0
+langfuse>=4.0,<5  # 可选 tracing,需配 LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY 才生效
 pydantic>=2.9,<3
 python-dotenv>=1.0
 sentence-transformers>=3.0
